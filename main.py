@@ -32,127 +32,154 @@ logger = setup_logger("UI_Layer")
 # =============================================================================
 STYLE_SHEET = """
 QMainWindow {
-    background-color: #0d0d0d;
+    background-color: #0b0b0d;
 }
 QWidget {
-    font-family: 'Segoe UI', Arial, sans-serif;
-    color: #ececec;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    color: #e1e1e6;
 }
 /* Sidebar Styles */
 QFrame#Sidebar {
-    background-color: #171717;
-    border-right: 1px solid #2e2e2e;
+    background-color: #111113;
+    border-right: 1px solid #1f1f22;
 }
 QPushButton.NavButton {
     background-color: transparent;
     border: none;
     text-align: left;
-    padding: 10px 15px;
+    padding: 14px 20px;
     font-size: 14px;
-    font-weight: bold;
-    color: #a0a0a0;
-    border-radius: 6px;
+    font-weight: 600;
+    color: #88888e;
+    border-radius: 8px;
+    margin: 4px 10px;
 }
 QPushButton.NavButton:hover {
-    background-color: #262626;
-    color: #ececec;
+    background-color: #1f1f22;
+    color: #ffffff;
 }
 QPushButton.NavButton:checked {
-    background-color: #2a2a2a;
-    color: #10a37f; /* Accent */
+    background-color: #10a37f22;
+    color: #10a37f;
 }
 /* Panels */
 QFrame.Panel {
-    background-color: #1e1e1e;
+    background-color: #161618;
     border-radius: 12px;
-    border: 1px solid #2e2e2e;
+    border: 1px solid #2a2a2d;
 }
-/* Transcript Box */
-QTextEdit#TranscriptBox {
-    background-color: #1a1a1a;
-    border: 1px solid #2e2e2e;
+/* Transcript Box & Inputs */
+QTextEdit {
+    background-color: #0b0b0d;
+    border: 1px solid #2a2a2d;
     border-radius: 8px;
-    padding: 10px;
-    font-family: 'Cascadia Code', monospace;
-    font-size: 13px;
-    line-height: 1.5;
+    padding: 15px;
+    color: #e1e1e6;
+    font-size: 14px;
+    selection-background-color: #10a37f;
 }
+QTextEdit#TranscriptBox {
+    font-family: 'Inter', 'Segoe UI Semibold';
+    font-size: 15px;
+    line-height: 1.7;
+    border-radius: 12px;
+}
+/* Fix for AI Context Box */
+QTextEdit#ContextPrompt {
+    background-color: #111113;
+    border: 1px solid #333336;
+}
+
+/* Combo Boxes (Critical Fix) */
+QComboBox {
+    background-color: #1f1f22;
+    border: 1px solid #333336;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #ffffff;
+    min-height: 25px;
+}
+QComboBox:hover { border-color: #10a37f; }
+QComboBox::drop-down { border: none; width: 30px; }
+QComboBox QAbstractItemView {
+    background-color: #161618;
+    border: 1px solid #333336;
+    color: #ffffff;
+    selection-background-color: #10a37f;
+    outline: none;
+    padding: 5px;
+}
+
 /* Headers */
 QLabel.Header {
-    font-size: 22px;
-    font-weight: bold;
+    font-size: 24px;
+    font-weight: 800;
     color: #ffffff;
+    letter-spacing: -0.5px;
 }
 QLabel.SubHeader {
-    font-size: 16px;
-    font-weight: bold;
-    color: #a0a0a0;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #88888e;
     margin-top: 15px;
 }
-/* Combo Boxes */
-QComboBox {
-    background-color: #262626;
-    border: 1px solid #333333;
-    border-radius: 6px;
-    padding: 6px;
-    font-size: 13px;
-}
-QComboBox:hover {
-    border: 1px solid #5b8def;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 25px;
-}
-QComboBox QAbstractItemView {
-    background-color: #1a1a1a;
-    border: 1px solid #333333;
-    selection-background-color: #2e7d32;
-    color: #ececec;
-}
-QComboBox QAbstractItemView::item {
-    padding: 8px;
-}
-QComboBox QAbstractItemView::item:selected {
-    background-color: #2e7d32;
-    color: #ffffff;
-}
+
 /* Action Buttons */
 QPushButton.PrimaryAction {
     background-color: #10a37f;
     color: #ffffff;
-    border: none;
+    font-weight: 700;
+    padding: 12px 20px;
     border-radius: 8px;
-    padding: 12px;
-    font-size: 14px;
-    font-weight: bold;
 }
-QPushButton.PrimaryAction:hover {
-    background-color: #0d8a6a;
-}
-QPushButton.PrimaryAction:disabled {
-    background-color: #262626;
-    color: #6b6b6b;
-}
-/* Secondary Buttons */
-QPushButton.SecondaryAction {
-    background-color: #2a2a2a;
-    color: #ececec;
-    border: 1px solid #333333;
-    border-radius: 6px;
-    padding: 8px 15px;
-    font-size: 13px;
-}
-QPushButton.SecondaryAction:hover {
-    background-color: #363636;
-}
-/* Status Bar */
-QFrame#StatusBar {
-    background-color: #171717;
-    border-top: 1px solid #2e2e2e;
-}
-"""
+QPushButton.PrimaryAction:hover { background-color: #16b38c; }
+QPushButton.PrimaryAction:disabled { background-color: #2a2a2d; color: #55555a; }
 
+/* Dedicated Small Buttons (Clear, Stop, Secondary) */
+QPushButton.SecondaryAction {
+    background-color: #1f1f22;
+    color: #e1e1e6;
+    border: 1px solid #333336;
+    border-radius: 8px;
+    padding: 8px 15px;
+    font-weight: 600;
+}
+QPushButton.SecondaryAction:hover { background-color: #2a2a2d; }
+
+QPushButton#BtnLive {
+    border: 1px solid #333336;
+    border-radius: 8px;
+    padding: 8px 15px;
+    font-weight: 600;
+    color: #e1e1e6;
+    background-color: #1f1f22;
+}
+QPushButton#BtnLive[active="true"] {
+    background-color: #ef4444; 
+    border-color: #ef4444;
+    color: white;
+}
+QPushButton#BtnClear {
+    background-color: #1f1f22;
+    border: 1px solid #333336;
+    color: #e1e1e6;
+    border-radius: 8px;
+    padding: 8px 15px;
+    font-weight: 600;
+}
+QPushButton#BtnClear:hover { background-color: #2a2a2d; color: #ef4444; border-color: #ef4444; }
+
+/* Custom Scrollbar */
+QScrollBar:vertical {
+    border: none; background: transparent; width: 8px;
+}
+QScrollBar::handle:vertical {
+    background: #2a2a2d; border-radius: 4px; min-height: 30px;
+}
+QScrollBar::handle:vertical:hover { background: #10a37f; }
+"""
 
 # =============================================================================
 # UI PANELS
@@ -238,6 +265,14 @@ class SettingsPanel(QFrame):
         noise_layout.addWidget(self.slider_noise)
         noise_layout.addWidget(self.lbl_noise_val)
         layout.addLayout(noise_layout)
+
+        # AI Context / Keywords
+        layout.addWidget(self._build_label("AI Context / Keywords (Improve Accuracy)"))
+        self.txt_context = QTextEdit()
+        self.txt_context.setPlaceholderText("Enter keywords or context here (e.g. AI, Machine Learning, Vietnam Today, specific names...)")
+        self.txt_context.setFixedHeight(80)
+        self.txt_context.setObjectName("ContextPrompt")
+        layout.addWidget(self.txt_context)
         
         layout.addStretch()
 
@@ -313,6 +348,7 @@ class TranscriptPanel(QFrame):
         lbl_title.setProperty("class", "Header")
         
         self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setObjectName("BtnClear")
         self.btn_clear.clicked.connect(self._clear_transcript)
         self.btn_clear.setFixedWidth(80)
         
@@ -331,8 +367,8 @@ class TranscriptPanel(QFrame):
         self.lbl_file.setStyleSheet("color: #a0a0a0;")
         
         self.btn_live = QPushButton("🔊 Start System Audio")
-        self.btn_live.setProperty("class", "SecondaryAction")
-        self.btn_live.setFixedWidth(120)
+        self.btn_live.setObjectName("BtnLive")
+        self.btn_live.setFixedWidth(130)
         
         file_layout.addWidget(self.btn_select_file)
         file_layout.addWidget(self.lbl_file, stretch=1)
@@ -341,7 +377,7 @@ class TranscriptPanel(QFrame):
 
         # --- Quick Config Bar (Added for Better UX) ---
         quick_config_frame = QFrame()
-        quick_config_frame.setStyleSheet("background-color: #262626; border-radius: 8px; border: 1px solid #333333;")
+        quick_config_frame.setStyleSheet("background-color: #111113; border-radius: 8px; border: 1px solid #1f1f22;")
         quick_config_layout = QHBoxLayout(quick_config_frame)
         quick_config_layout.setContentsMargins(15, 10, 15, 10)
         quick_config_layout.setSpacing(20)
@@ -449,7 +485,7 @@ class TranscriptPanel(QFrame):
         cursor.movePosition(QTextCursor.End)
         
         # Handle Speaker Tagging / Coloring seamlessly
-        colors = {"SPEAKER_01": QColor("#5b8def"), "SPEAKER_02": QColor("#10a37f")}
+        colors = {"SYS": QColor("#10a37f"), "MIC": QColor("#5b8def"), "SPEAKER_01": QColor("#5b8def"), "SPEAKER_02": QColor("#10a37f")}
         
         for speaker, text in result.get("speakers", []):
             fmt = QTextCharFormat()
@@ -677,6 +713,7 @@ class MainWindow(QMainWindow):
             noise_gate = self.page_settings.slider_noise.value() / 1000
             enable_sys = self.page_settings.chk_sys.isChecked()
             enable_mic = self.page_settings.chk_mic.isChecked()
+            prompt = self.page_settings.txt_context.toPlainText().strip()
             
             if not enable_sys and not enable_mic:
                 self._update_status_ui("Please enable at least one source (Mic or Sys).", "error")
@@ -691,7 +728,8 @@ class MainWindow(QMainWindow):
                 enable_sys=enable_sys,
                 enable_mic=enable_mic,
                 device_index=device_idx,
-                noise_gate=noise_gate
+                noise_gate=noise_gate,
+                prompt=prompt
             )
         else:
             # Stop

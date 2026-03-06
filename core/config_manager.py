@@ -21,7 +21,24 @@ class ConfigManager:
             "source_lang": "Auto-Detect",
             "target_lang": "None (Off)",
             "input_device_index": None,
-            "theme": "Dark"
+            "theme": "Dark",
+            # Language inference settings
+            # When True, the language selected in the UI is forced into Whisper.
+            # Set to False to let Whisper auto-detect even if a language is selected.
+            "force_language": True,
+            # Pin a specific Whisper model regardless of auto-selection.
+            # Leave empty ("") to let AIEngine pick based on detected VRAM.
+            "whisper_model_override": "",
+            # Ultra realtime mode: 0.3s chunks, aggressive VAD, no context memory.
+            # Targets end-to-end latency < 1 second. Trade-off: slightly lower accuracy.
+            "ultra_realtime_mode": False,
+            # Vietnamese-specific prompt injected automatically when language=="vi".
+            # Add domain keywords (names, topics) here to boost recognition accuracy.
+            "vi_base_prompt": (
+                "Xin chào. Đây là hội thoại tiếng Việt thông thường. "
+                "Nội dung bao gồm tin tức, công nghệ, giáo dục và đời sống hàng ngày tại Việt Nam. "
+                "Người nói sử dụng giọng miền Nam hoặc miền Bắc."
+            ),
         }
         self.settings = self.defaults.copy()
         self.load()
