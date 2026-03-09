@@ -658,12 +658,20 @@ class MainWindow(QMainWindow):
         # UI Action requests Controller method
         self.page_transcript.btn_action.clicked.connect(self._trigger_backend_transcription)
         self.page_transcript.btn_live.clicked.connect(self._toggle_live_streaming)
-        
+
+        # Clear button → also clears TranscriptBuffer + restarts TranslationWorker
+        self.page_transcript.btn_clear.clicked.connect(self._clear_all)
+
         # Controller updates View via Signals
         self.controller.controller_status.connect(self._update_status_ui)
         self.controller.transcript_progress.connect(self.page_transcript.update_progress)
         self.controller.transcript_result.connect(self._handle_result_ui)
+
+        # Pipeline 1 — raw STT partial output
         self.controller.streaming_chunk_ready.connect(self.page_transcript.append_transcript)
+
+        # Pipeline 2 — translated output (THIS was the missing connection)
+        self.controller.translation_ready.connect(self._handle_translation_ui)
 
     @Slot()
     def _trigger_backend_transcription(self):
@@ -745,6 +753,47 @@ class MainWindow(QMainWindow):
         
         if level == "error":
             self.page_transcript.set_loading_state(False)
+
+    @Slot(dict)
+    def _handle_translation_ui(self, data: dict):
+        """Pipeline 2 output — display translated text in the transcript box.
+
+        Receives: {src, translated, text, clear?} from AppController.
+        Translated lines are shown in teal with a ↳ prefix so users can
+        visually distinguish them from the raw STT output (white/grey).
+        """
+        # Clear command from controller.clear_all()
+        if data.get("clear"):
+            self.page_transcript.text_edit.clear()
+            return
+
+        translated = data.get("translated", "").strip()
+        src_text   = data.get("src", "").strip()
+        if not translated:
+            return
+
+        cursor = self.page_transcript.text_edit.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        # Teal prefix label
+        fmt_label = QTextCharFormat()
+        fmt_label.setForeground(QColor("#10a37f"))
+        fmt_label.setFontWeight(QFont.Bold)
+        cursor.insertText("  ↳ [TR] ", fmt_label)
+
+        # Translated text in a lighter teal-ish white
+        fmt_text = QTextCharFormat()
+        fmt_text.setForeground(QColor("#a8d8c8"))
+        fmt_text.setFontWeight(QFont.Normal)
+        cursor.insertText(f"{translated}\n", fmt_text)
+
+        self.page_transcript.text_edit.ensureCursorVisible()
+
+    @Slot()
+    def _clear_all(self):
+        """Clear transcript display + reset pipeline 2 state."""
+        self.page_transcript.text_edit.clear()
+        self.controller.clear_all()
 
     @Slot(dict)
     def _handle_result_ui(self, result: dict):

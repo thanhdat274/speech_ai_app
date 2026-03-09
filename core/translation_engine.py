@@ -1,18 +1,30 @@
 """
 translation_engine.py
 =============================================================================
-Local AI Translation Engine — Meta NLLB-200
+Local AI Translation Engine — Meta NLLB-200 (facebook/nllb-200-distilled-600M)
 
-Fully offline translation using facebook/nllb-200-distilled-600M.
-No API calls. GPU-accelerated with automatic CPU fallback.
+Fully offline translation. GPU-accelerated with automatic CPU fallback.
+
+v7 Dual-Pipeline Architecture Role:
+    This module is used by BOTH:
+      1. TranslationWorker (Pipeline 2 daemon thread) — primary consumer.
+         Calls translate(text, src_lang, tgt_lang) synchronously.
+         The worker's polling loop (200 ms) naturally serialises calls.
+
+      2. TranslationEngine.translate_async() — kept for backward compat.
+         Routes through the internal ThreadPoolExecutor.
+
+    In v7, the primary path is:
+        TranscriptBuffer → TranslationWorker → LocalTranslator.translate()
 
 Supported language pairs:
     Vietnamese ↔ English, Japanese, Korean, Chinese, French, German, Spanish
     English ↔ all of the above
 
-Performance targets:
+Performance targets (Step 8):
     GPU (float16):  < 50 ms per short sentence
-    CPU (float32):  < 100 ms per short sentence
+    CPU (float32):  < 150 ms per short sentence
+    Translation queue maxsize: 20
 =============================================================================
 """
 
@@ -31,13 +43,11 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # NLLB-200 Language Code Mapping
 # ─────────────────────────────────────────────────────────────
-# Maps human-readable names → NLLB flores-200 codes.
-# Full list: https://github.com/facebookresearch/flores/blob/main/flores200/README.md
 NLLB_LANG_MAP: Dict[str, str] = {
-    # Primary languages
+    # Primary languages (Section 7 targets)
     "english":    "eng_Latn",
     "vietnamese": "vie_Latn",
-    # East Asian
+    # East Asian (Section 7 targets)
     "japanese":   "jpn_Jpan",
     "chinese":    "zho_Hans",
     "korean":     "kor_Hang",
@@ -54,10 +64,13 @@ NLLB_LANG_MAP: Dict[str, str] = {
     "malay":      "zsm_Latn",
 }
 
-# Also accept NLLB codes directly (pass-through)
 _VALID_NLLB_CODES = set(NLLB_LANG_MAP.values())
 
 MODEL_ID = "facebook/nllb-200-distilled-600M"
+
+# Translation queue config (Step 8: queue size = 20)
+_TRANSLATION_QUEUE_MAXSIZE = 20   # Bounded — v7 target: < 5/20 usage
+_TRANSLATION_TIMEOUT_S     = 15.0  # Max time for a single translation job
 
 
 def _resolve_lang(lang: str) -> str:
@@ -73,16 +86,13 @@ def _resolve_lang(lang: str) -> str:
     if not lang:
         raise ValueError("Language code cannot be empty")
 
-    # Already a valid NLLB code
     if lang in _VALID_NLLB_CODES:
         return lang
 
-    # Human-readable lookup (case-insensitive)
     key = lang.lower().strip()
     if key in NLLB_LANG_MAP:
         return NLLB_LANG_MAP[key]
 
-    # Whisper ISO-639-1 shortcodes
     _WHISPER_MAP = {
         "en": "eng_Latn", "vi": "vie_Latn", "ja": "jpn_Jpan",
         "zh": "zho_Hans", "ko": "kor_Hang", "fr": "fra_Latn",
@@ -107,7 +117,7 @@ class LocalTranslator:
 
     - Lazy-loads model on first translate() call
     - float16 on CUDA, float32 on CPU
-    - Greedy decoding (num_beams=1) for < 100ms latency
+    - Greedy decoding (num_beams=1) for < 100 ms latency
     - Supports single string and batch (list) translation
     """
 
@@ -117,7 +127,6 @@ class LocalTranslator:
         self._tokenizer = None
         self._lock = threading.Lock()
 
-        # Hardware detection
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._dtype = torch.float16 if self._device == "cuda" else torch.float32
 
@@ -136,12 +145,11 @@ class LocalTranslator:
 
         with self._lock:
             if self._model is not None:
-                return  # Double-checked locking
+                return
 
             logger.info(f"Loading NLLB model: {self.model_id} on {self._device.upper()}...")
             start = time.perf_counter()
 
-            # Suppress noisy HuggingFace warnings
             import warnings
             warnings.filterwarnings("ignore", message=".*not sharded.*")
             warnings.filterwarnings("ignore", message=".*unauthenticated.*")
@@ -195,7 +203,10 @@ class LocalTranslator:
         src_lang: str,
         tgt_lang: str,
     ) -> Union[str, List[str]]:
-        """Translate text from src_lang to tgt_lang.
+        """Translate complete sentence(s) from src_lang to tgt_lang.
+
+        Section 7: Only complete sentences (from SentenceBuilder) should
+        be passed here. Never raw ASR fragments.
 
         Args:
             text:     A string or list of strings to translate.
@@ -212,12 +223,10 @@ class LocalTranslator:
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
 
-        # Skip empty/whitespace-only inputs
         texts = [t for t in texts if t and t.strip()]
         if not texts:
             return "" if is_single else []
 
-        # Resolve language codes
         try:
             src_code = _resolve_lang(src_lang)
             tgt_code = _resolve_lang(tgt_lang)
@@ -225,7 +234,6 @@ class LocalTranslator:
             logger.error(f"Language resolution error: {e}")
             return text
 
-        # Skip if source == target
         if src_code == tgt_code:
             return text
 
@@ -236,10 +244,8 @@ class LocalTranslator:
         start = time.perf_counter()
 
         try:
-            # Set source language for tokenizer
             self._tokenizer.src_lang = src_code
 
-            # Tokenize
             inputs = self._tokenizer(
                 texts,
                 return_tensors="pt",
@@ -248,10 +254,8 @@ class LocalTranslator:
                 max_length=512,
             ).to(self._device)
 
-            # Get target language token ID
             tgt_lang_id = self._tokenizer.convert_tokens_to_ids(tgt_code)
 
-            # Generate translation — greedy decoding for speed
             with torch.inference_mode():
                 gen_tokens = self._model.generate(
                     **inputs,
@@ -261,7 +265,6 @@ class LocalTranslator:
                     do_sample=False,
                 )
 
-            # Decode
             outputs = self._tokenizer.batch_decode(
                 gen_tokens, skip_special_tokens=True
             )
@@ -293,13 +296,23 @@ class LocalTranslator:
 
 # ─────────────────────────────────────────────────────────────
 # TranslationEngine — Singleton + async dispatcher
+#
+# Section 7 Implementation:
+#   - translation_queue: dedicated bounded queue for completed sentences
+#   - Worker runs in separate thread (never blocks ASR pipeline)
+#   - Language detection from Whisper result.language (passed by caller)
+#   - Supported: Vietnamese, English, Japanese, Korean, Chinese (+ more)
 # ─────────────────────────────────────────────────────────────
 class TranslationEngine:
     """Singleton wrapper providing async and sync translation.
 
-    - Lazy-loads LocalTranslator on first use
-    - translate_async() never blocks the caller (speech pipeline)
-    - translate() is synchronous for one-shot / offline use
+    v7 Dual-Pipeline Architecture:
+    - Primary consumer: TranslationWorker calls translate() (synchronous)
+      via TranscriptBuffer polling. This is the recommended path.
+    - Legacy: translate_async() enqueues sentences to internal executor.
+      Kept for backward compatibility with any direct callers.
+    - translation_queue bounded at 20 (Step 8: queue < 5/20 target)
+    - Language detection: Whisper result.language forwarded by caller
     """
 
     _instance: Optional["TranslationEngine"] = None
@@ -318,14 +331,12 @@ class TranslationEngine:
         self._initialized = True
         self._lock = threading.Lock()
 
-        # The single translator instance (lazy-loaded)
         self._translator: Optional[LocalTranslator] = None
 
-        # Async translation infrastructure:
-        # - _queue decouples callers from the worker so transcription never blocks.
-        # - ThreadPoolExecutor(max_workers=1) serialises model calls (NLLB is not
-        #   concurrency-safe) while keeping translation off the main thread.
-        self._queue: queue.Queue = queue.Queue()
+        # v8: translation_queue — bounded at 20
+        self.translation_queue: queue.Queue = queue.Queue(maxsize=_TRANSLATION_QUEUE_MAXSIZE)
+
+        # Single executor worker — NLLB is not concurrency-safe
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="translator"
         )
@@ -337,14 +348,36 @@ class TranslationEngine:
         )
         self._dispatcher.start()
 
+        # Stats
+        self._total_translated = 0
+        self._total_dropped = 0
+
+        # v8: PRELOAD MODEL AT STARTUP in background thread
+        # This ensures the model is warm before the first sentence arrives.
+        # No more blocking on the first translate() call during live capture.
+        self._preload_thread = threading.Thread(
+            target=self._preload_model_bg,
+            name="nllb-preload",
+            daemon=True,
+        )
+        self._preload_thread.start()
+        logger.info(
+            "[TranslationEngine] Preloading NLLB model in background — "
+            "translation will be ready before first audio chunk."
+        )
+
     # ------------------------------------------------------------------
     # Internal async machinery
     # ------------------------------------------------------------------
     def _dispatch_loop(self) -> None:
-        """Drain the input queue and submit each job to the executor."""
+        """Drain the translation_queue and submit complete sentences to executor.
+
+        Section 7: Only complete sentences arrive here (from SentenceBuilder).
+        Queue depth is monitored — if full, oldest item is dropped with warning.
+        """
         while self._running:
             try:
-                item = self._queue.get(timeout=0.05)
+                item = self.translation_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
 
@@ -367,13 +400,46 @@ class TranslationEngine:
         try:
             translator = self._get_translator()
             result = translator.translate(text, src_lang, tgt_lang)
+            self._total_translated += 1
             callback(result)
         except Exception as e:
             logger.error(f"Async translation error: {e}")
             callback(text)  # fall back to original text
 
+    def _preload_model_bg(self) -> None:
+        """Run _ensure_loaded() in a background thread at startup.
+
+        v8: Called from __init__ so the model is warm before any sentence arrives.
+        The first translate() call returns immediately instead of blocking 5–30 s.
+        """
+        try:
+            t = time.perf_counter()
+            self._get_translator()  # triggers LocalTranslator._ensure_loaded()
+            elapsed = (time.perf_counter() - t) * 1000
+            logger.info(
+                f"[TranslationEngine] NLLB model preloaded in {elapsed:.0f}ms — "
+                f"translation pipeline ready."
+            )
+        except Exception as e:
+            logger.error(f"[TranslationEngine] Preload failed: {e}")
+
+    def preload_model(self) -> None:
+        """Block until the NLLB model is fully loaded.
+
+        Call this from AppController.__init__ after TranslationEngine() is
+        instantiated — ensures model is ready before the first capture starts.
+        If the background preload is already done this returns immediately.
+        """
+        if self._preload_thread.is_alive():
+            logger.info(
+                "[TranslationEngine] Waiting for background NLLB preload to finish..."
+            )
+            self._preload_thread.join()
+        else:
+            logger.debug("[TranslationEngine] NLLB model already loaded.")
+
     def _get_translator(self) -> LocalTranslator:
-        """Get or create the LocalTranslator instance."""
+        """Get or create the LocalTranslator instance (thread-safe)."""
         if self._translator is None:
             with self._lock:
                 if self._translator is None:
@@ -390,16 +456,48 @@ class TranslationEngine:
         tgt_lang: str,
         callback: Callable[[Union[str, List[str]]], None],
     ) -> None:
-        """Non-blocking translation.
+        """Non-blocking translation of a COMPLETE sentence.
 
-        Enqueues *text* for translation. When the result is ready,
-        *callback* is invoked from the background executor thread with
-        the translated text. The calling thread returns immediately —
-        speech transcription is never stalled.
+        Section 7: Only complete sentences from SentenceBuilder should be
+        passed here. Do NOT translate raw ASR fragments.
+
+        Enqueues the sentence. When ready, callback is invoked from the
+        background executor thread. The caller returns immediately — the
+        ASR transcription pipeline is never stalled by translation.
+
+        If the queue is full (NLLB is backed up), the OLDEST item is
+        dropped and a warning is logged.
         """
         if not text:
             return
-        self._queue.put((text, src_lang, tgt_lang, callback))
+
+        depth = self.translation_queue.qsize()
+        q_pct = depth / _TRANSLATION_QUEUE_MAXSIZE * 100
+
+        if q_pct >= 80:
+            logger.warning(
+                f"Translation queue at {q_pct:.0f}% "
+                f"({depth}/{_TRANSLATION_QUEUE_MAXSIZE}) — "
+                "consider checking NLLB performance."
+            )
+
+        try:
+            self.translation_queue.put_nowait((text, src_lang, tgt_lang, callback))
+        except queue.Full:
+            # Drop oldest item to make room (ASR pipeline must not stall)
+            try:
+                dropped = self.translation_queue.get_nowait()
+                self._total_dropped += 1
+                logger.warning(
+                    f"Translation queue full — dropped oldest sentence: {str(dropped[0])[:50]!r} "
+                    f"(total dropped: {self._total_dropped})"
+                )
+            except queue.Empty:
+                pass
+            try:
+                self.translation_queue.put_nowait((text, src_lang, tgt_lang, callback))
+            except queue.Full:
+                pass
 
     def translate(
         self,
@@ -410,6 +508,16 @@ class TranslationEngine:
         """Synchronous translation (kept for one-shot / offline use)."""
         translator = self._get_translator()
         return translator.translate(text, src_lang, tgt_lang)
+
+    def get_queue_stats(self) -> dict:
+        """Return queue depth statistics for monitoring."""
+        return {
+            "depth": self.translation_queue.qsize(),
+            "maxsize": _TRANSLATION_QUEUE_MAXSIZE,
+            "pct": self.translation_queue.qsize() / _TRANSLATION_QUEUE_MAXSIZE * 100,
+            "total_translated": self._total_translated,
+            "total_dropped": self._total_dropped,
+        }
 
     # Backward compatibility aliases
     def load_model(self, model_type: str = "nllb") -> None:
@@ -427,7 +535,11 @@ class TranslationEngine:
     def shutdown(self) -> None:
         """Stop the background dispatcher and executor gracefully."""
         self._running = False
-        self._queue.put(None)  # unblock dispatcher
+        self.translation_queue.put(None)  # unblock dispatcher
         self._executor.shutdown(wait=True)
         self.clear_cache()
-        logger.info("TranslationEngine shut down.")
+        logger.info(
+            f"TranslationEngine shut down. "
+            f"Stats: translated={self._total_translated}, "
+            f"dropped={self._total_dropped}"
+        )

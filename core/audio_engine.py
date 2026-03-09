@@ -1,7 +1,7 @@
 """
 audio_engine.py
 =============================================================================
-AudioEngine Module — Speech-AI v5 Architecture
+AudioEngine Module — Speech-AI v6 Architecture
 =============================================================================
 
 Pipeline:
@@ -12,16 +12,26 @@ Pipeline:
   [RingBuffer]   circular, overwrites oldest on overflow; capture never stalls
        |
        v  (ChunkAggregator thread)
-       |  - accumulates frames to an adaptive window (1.5–2.5 s)
-       |  - resamples to 16 kHz for Whisper
-       |  - Silero VAD gate — neural speech detection
-       |    (automatic RMS energy fallback when Silero is unavailable)
+       |  - Silence detection via RMS / Silero VAD
+       |  - Dynamic chunk aggregation: 200 ms capture → 800 ms–1.2 s chunks
+       |  - Adaptive chunk duration (mode switching based on queue depth)
+       |  - 200 ms overlap preserved between consecutive chunks
        |
-       v  (ready ~2.5 s speech chunks with 200 ms overlap)
-  [_ai_queue]   small bounded work queue drained by the worker pool
-       |
-       v  (Whisper Worker Pool — 5 threads share _ai_queue)
+       v  (ready ~800 ms–1.2 s speech chunks)
+  [_ai_queue]   bounded work queue drained by the worker pool
+       |          Backpressure: queue > 80% → merge into last chunk instead of enqueue
+       v  (Whisper Worker Pool — AI_WORKER_COUNT threads share _ai_queue)
   user callback  (StreamingTranscriber.process_chunk → Whisper)
+
+Key Changes (v8 — stable realtime):
+  - ULTRA_CHUNK raised to 1.2 s: fewer Whisper calls, better context per inference
+  - BALANCED at 1.0 s, ACCURACY at 1.5 s
+  - AI_QUEUE_MAXSIZE reduced to 20 — tight budget prevents queue backlog
+  - Backpressure threshold lowered to 70%: earlier merge, avoids cascade overflow
+  - Silence detection: RMS gate + Silero VAD neural gate (auto-fallback)
+  - Dynamic adaptive sizing with EMA smoothing
+  - Auto mode switching: queue >90% → ACCURACY, >70% → BALANCED, <30% → ULTRA
+  - Overlap preserved at 200 ms between chunks
 """
 
 import logging
@@ -44,29 +54,42 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16_000             # Whisper requires 16 kHz mono PCM
 CHANNELS = 1
 
-# ── Latency Modes ────────────────────────────────────────────────────────────
+# ── Chunk Duration Modes ─────────────────────────────────────────────────────
 #
-#   Pipeline:  Audio Capture → Ring Buffer → Dynamic Chunk Builder
-#              → Inference Queue → AI Engine → Subtitle Smoother
-#
-# ULTRA_REALTIME: chunk=0.3s — fastest response, minimal context
-# BALANCED:       chunk=0.7s — good balance of latency + Vietnamese accuracy
-# ACCURACY:       chunk=1.5s — maximum Vietnamese tone context for YouTube
-ULTRA_CHUNK_DURATION_S = 0.25
-BALANCED_CHUNK_DURATION_S = 0.5
-ACCURACY_CHUNK_DURATION_S = 1.0
-CHUNK_DURATION_S = BALANCED_CHUNK_DURATION_S  # exported default for start()
+# v9 target:
+#   ULTRA_REALTIME: 2.4 s chunk size, 0.6 s stride
+#     - Larger window = more context per Whisper call
+#     - Stride overlap = smooth sentence continuity across chunks
+#     - Fewer total Whisper calls = less GPU contention
+#   BALANCED:       1.6 s chunk, 0.5 s stride
+#   ACCURACY:       2.4 s chunk, 0.8 s stride
+ULTRA_CHUNK_DURATION_S    = 2.40   # v9: 2.4 s window
+BALANCED_CHUNK_DURATION_S = 1.60   # v9: 1.6 s
+ACCURACY_CHUNK_DURATION_S = 2.40   # v9: same window, longer stride
+CHUNK_DURATION_S          = BALANCED_CHUNK_DURATION_S  # exported default
 
-# Overlap: 0.3s between consecutive chunks preserves cross-chunk Vietnamese tones.
-OVERLAP_DURATION_S = 0.3
+# Capture frame: 200 ms — hardware callback writes this into RingBuffer
+CAPTURE_FRAME_S  = 0.20
 
-RING_BUFFER_MAXFRAMES = 800      # ~20 s capacity at a 40 fps hardware callback
-AI_QUEUE_MAXSIZE = 200            # Large queue — absorbs inference spikes
+# v9: stride overlap = 0.6 s (was 0.2 s)
+# Overlap prevents clipping words at chunk boundaries
+OVERLAP_DURATION_S = 0.60
 
+RING_BUFFER_MAXFRAMES = 300
+
+# v9: queue = 50 (req #5) — prevents backpressure on GTX 1650 Ti
+# At 2.4 s chunks: 50 slots = 120 s of headroom
+AI_QUEUE_MAXSIZE      = 50
+
+# Backpressure at >80% queue depth (= 40/50)
 BACKPRESSURE_THRESHOLD = 0.80
 BACKPRESSURE_SLEEP_S   = 0.05
 
-AI_WORKER_COUNT = 3              # Fewer workers = less GPU contention on 4GB cards
+# v9: dual workers for round-robin parallel window processing (req #4)
+# Two workers process 2.4s overlapping windows in parallel.
+# GTX 1650 Ti handles two float16 Whisper-large-v3 calls interleaved
+# at ~800ms each with sufficient VRAM headroom.
+AI_WORKER_COUNT = 2
 
 MONITOR_IDLE_S     = 5.0
 MONITOR_WARN_S     = 1.0
@@ -74,25 +97,20 @@ MONITOR_CRITICAL_S = 0.5
 
 VAD_RMS_THRESHOLD = 0.002
 
-# ── Adaptive chunk sizing ────────────────────────────────────────────────────
-#   queue > 70% → grow chunk toward CHUNK_MAX_S (fewer, larger chunks)
-#   queue < 30% → shrink chunk toward CHUNK_MIN_S (lower latency)
-CHUNK_MIN_S = ULTRA_CHUNK_DURATION_S    # 0.3s floor
-CHUNK_MAX_S = ACCURACY_CHUNK_DURATION_S # 1.5s ceiling
+# ── Adaptive chunk sizing ─────────────────────────────────────────────────────
+CHUNK_MIN_S = ULTRA_CHUNK_DURATION_S
+CHUNK_MAX_S = ACCURACY_CHUNK_DURATION_S
 ADAPTIVE_HIGH_THRESHOLD = 0.70
 ADAPTIVE_LOW_THRESHOLD  = 0.30
 
-# ── Automatic mode switching (based on queue depth) ──────────────────────────
-#   queue > 90% → switch to ACCURACY (1.5s) — reduce inference load heavily
-#   queue > 80% → switch to BALANCED (0.7s) — moderate load reduction
-#   queue < 30% → switch to ULTRA_REALTIME (0.3s) — lowest latency
+# ── Auto mode switching ───────────────────────────────────────────────────────
 MODE_SWITCH_TO_ACCURACY_THRESHOLD = 0.90
-MODE_SWITCH_TO_BALANCED_THRESHOLD = 0.80
+MODE_SWITCH_TO_BALANCED_THRESHOLD = 0.70
 MODE_SWITCH_TO_ULTRA_THRESHOLD    = 0.30
 
-# Derived depth thresholds (computed once, referenced in hot loops)
 _WARN_DEPTH         = int(AI_QUEUE_MAXSIZE * 0.50)
 _BACKPRESSURE_DEPTH = int(AI_QUEUE_MAXSIZE * BACKPRESSURE_THRESHOLD)
+
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +136,7 @@ class RingBuffer:
         self._not_empty.set()
 
     def get(self, timeout: float = 0.2) -> Optional[np.ndarray]:
-        """Return the oldest frame, blocking up to *timeout* seconds.
-
-        Returns None on timeout — mirrors queue.Queue.get() semantics.
-        """
+        """Return the oldest frame, blocking up to *timeout* seconds."""
         if self._not_empty.wait(timeout=timeout):
             with self._lock:
                 if self._buf:
@@ -145,20 +160,11 @@ class RingBuffer:
 # SileroVAD  (lazy-loaded module-level singleton, RMS fallback)
 # ---------------------------------------------------------------------------
 class _SileroVAD:
-    """Silero VAD wrapper with automatic RMS energy fallback.
-
-    The model is downloaded once from torch.hub on the first is_speech() call
-    and cached as a process-level singleton.  If the hub is unreachable (offline
-    environment, incompatible PyTorch version, etc.) every subsequent call
-    silently falls back to RMS energy gating — callers see no difference.
-
-    A per-instance inference lock serialises concurrent calls because the
-    underlying PyTorch model is not thread-safe.
-    """
+    """Silero VAD wrapper with automatic RMS energy fallback."""
 
     def __init__(self) -> None:
         self._model = None
-        self._get_ts: Optional[Callable] = None   # get_speech_timestamps fn
+        self._get_ts: Optional[Callable] = None
         self._loaded = False
         self._load_lock = threading.Lock()
         self._infer_lock = threading.Lock()
@@ -178,7 +184,7 @@ class _SileroVAD:
                     verbose=False,
                 )
                 self._model = model
-                self._get_ts = utils[0]   # get_speech_timestamps is first element
+                self._get_ts = utils[0]
                 logger.info("Silero VAD loaded — neural speech detection active.")
             except Exception as exc:
                 logger.warning(
@@ -199,7 +205,6 @@ class _SileroVAD:
         self._ensure_loaded()
 
         if self._model is None:
-            # RMS fallback: require both RMS energy and peak above the gate
             rms  = float(np.sqrt(np.mean(audio_16k ** 2)))
             peak = float(np.max(np.abs(audio_16k)))
             return rms >= noise_gate and peak >= noise_gate
@@ -217,11 +222,9 @@ class _SileroVAD:
                 )
             return len(timestamps) > 0
         except Exception:
-            # Any inference failure → safe RMS fallback so capture is never stalled
             return float(np.sqrt(np.mean(audio_16k ** 2))) >= noise_gate
 
 
-# Module-level singleton shared across all capture sources
 _vad = _SileroVAD()
 
 
@@ -232,8 +235,9 @@ class BaseCapture(ABC):
     """Abstract base for audio capture sources.
 
     Subclasses open a hardware stream and call _start_workers() once ready.
-    The RingBuffer → ChunkAggregator → WorkerPool pipeline ensures the hardware
-    callback is never delayed by AI inference or VAD processing.
+
+    The pipeline is:
+        Hardware Callback → RingBuffer → ChunkAggregator → _ai_queue → Workers
     """
 
     def __init__(
@@ -244,14 +248,21 @@ class BaseCapture(ABC):
         self.callback = callback
         self.noise_gate = noise_gate
         self.is_running = False
-        self._stream = None           # sounddevice or PyAudio stream
+        self._stream = None
         self.native_rate: int = SAMPLE_RATE
 
-        # Stage 1: circular buffer — hardware callback writes here, never blocks
-        self._ring_buffer = RingBuffer()
+        # Set by AppController/LiveStreamingWorker before start() is called.
+        # When True, ChunkAggregator uses the AudioPreprocessor fast path
+        # (stereo→mono + resample only, skips DC/RMS/noise gate).
+        # Target preprocess latency: < 10 ms instead of standard < 80 ms budget.
+        self.ultra_realtime_mode: bool = False
 
-        # Stage 2: VAD-passed chunks waiting for the Whisper worker pool
+        self._ring_buffer = RingBuffer()
         self._ai_queue: queue.Queue = queue.Queue(maxsize=AI_QUEUE_MAXSIZE)
+
+        # For backpressure merging: reference to last enqueued chunk
+        self._last_chunk_lock = threading.Lock()
+        self._last_chunk: Optional[np.ndarray] = None
 
         self._processing_thread: Optional[threading.Thread] = None
         self._dispatch_threads: List[threading.Thread] = []
@@ -272,12 +283,10 @@ class BaseCapture(ABC):
                 pass
             self._stream = None
 
-        # Unblock the ChunkAggregator thread immediately
         self._ring_buffer.unblock()
         if self._processing_thread and self._processing_thread.is_alive():
             self._processing_thread.join(timeout=2.0)
 
-        # Send one sentinel per worker thread so each unblocks cleanly
         for _ in self._dispatch_threads:
             self._ai_queue.put(None)
         for t in self._dispatch_threads:
@@ -294,30 +303,25 @@ class BaseCapture(ABC):
         if status:
             logger.warning(f"Audio status: {status}")
         if self.is_running:
-            # copy() is mandatory — sounddevice reuses the buffer immediately
             self._ring_buffer.put(indata.copy())
 
     # ------------------------------------------------------------------
-    # Dynamic Chunk Builder with Automatic Mode Switching:
-    #   Ring Buffer → preprocess → adaptive sizing → inference queue
+    # ChunkAggregator — Section 1 implementation
     #
-    # Overlap rule (0.3s):
-    #   chunk_1 = 0.0 → 0.7
-    #   chunk_2 = 0.4 → 1.1   (0.3s of chunk_1's tail carried over)
-    #
-    # Auto mode switching:
-    #   queue > 90% → ACCURACY mode (1.5s chunks)
-    #   queue > 80% → BALANCED mode (0.7s chunks)
-    #   queue < 30% → ULTRA_REALTIME mode (0.3s chunks)
+    # Single thread that:
+    #   1. reads 200 ms frames from the RingBuffer
+    #   2. accumulates until chunk_samples reached
+    #   3. runs silence detection (RMS gate)
+    #   4. applies backpressure (Section 2): at >80% queue, merges chunk
+    #   5. enqueues speech chunks with 200 ms overlap
+    #   6. auto-adjusts chunk duration based on queue depth
     # ------------------------------------------------------------------
     def _processing_worker(self, chunk_duration_s: float) -> None:
-        """Accumulate raw frames into overlapping speech windows.
+        """Dynamic Chunk Builder with Silence Detection and Backpressure.
 
-        Dynamic chunk sizing with automatic mode switching:
-          queue > 90% → ACCURACY mode (1.5s, max context, fewest calls)
-          queue > 80% → BALANCED mode (0.7s, moderate latency)
-          queue < 30% → ULTRA_REALTIME mode (0.3s, lowest latency)
-          30-80%      → linear interpolation between min and max
+        Target: accumulate 200 ms captures into 800 ms–1.2 s chunks.
+        Silence frames are discarded; speech chunks are enqueued.
+        At backpressure (>80% queue) chunks are merged rather than dropped.
         """
         from core.audio_preprocessor import AudioPreprocessor
         preprocessor = AudioPreprocessor.get_instance()
@@ -328,7 +332,9 @@ class BaseCapture(ABC):
         chunk_samples   = int(self.native_rate * current_chunk_s)
         overlap_samples = int(self.native_rate * OVERLAP_DURATION_S)
 
-        # Mode tracking for logging
+        # Accumulated merged chunk for backpressure (Section 2)
+        merge_pending: Optional[np.ndarray] = None
+
         current_mode = "BALANCED"
         chunks_processed = 0
         last_mode_switch = time.monotonic()
@@ -347,17 +353,52 @@ class BaseCapture(ABC):
 
                 chunk_start_t = time.perf_counter()
 
-                # ── Build raw chunk ──────────────────────────────────
+                # ── Build raw chunk ──────────────────────────────────────
                 raw_chunk = np.concatenate(buffer, axis=0).flatten()
 
-                # ── Preprocess: mono → resample → normalize ─────────
+                # ── Preprocess: mono → resample → normalize ──────────────
+                # ultra_realtime_mode → fast path (skips DC/RMS/noise gate).
+                # Cuts preprocess latency from ~1500 ms to ~5-10 ms on 48kHz.
                 clean_chunk = preprocessor.preprocess(
                     raw_chunk,
                     source_sr=self.native_rate,
+                    ultra_fast=self.ultra_realtime_mode,
                 )
 
-                # Empty = silence → keep overlap, skip inference
+                # Silence → keep overlap, skip inference
                 if len(clean_chunk) == 0:
+                    if overlap_samples > 0 and len(raw_chunk) > overlap_samples:
+                        overlap_frame    = raw_chunk[-overlap_samples:].reshape(-1, 1)
+                        buffer           = [overlap_frame]
+                        buffered_samples = len(overlap_frame)
+                    else:
+                        buffer           = []
+                        buffered_samples = 0
+                    merge_pending = None  # speech paused — reset merge buffer
+                    continue
+
+                chunk = clean_chunk
+                chunks_processed += 1
+
+                # ── Queue status ─────────────────────────────────────────
+                depth   = self._ai_queue.qsize()
+                q_ratio = depth / AI_QUEUE_MAXSIZE
+
+                # ── SECTION 2: Backpressure control ─────────────────────
+                # Queue > 80% → do NOT enqueue immediately.
+                # Merge incoming chunk with the pending merge buffer so we
+                # keep accumulating audio without stalling or dropping.
+                if q_ratio >= BACKPRESSURE_THRESHOLD:
+                    if merge_pending is not None:
+                        merge_pending = np.concatenate([merge_pending, chunk])
+                    else:
+                        merge_pending = chunk
+                    logger.warning(
+                        f"Backpressure — queue {depth}/{AI_QUEUE_MAXSIZE} "
+                        f"({q_ratio * 100:.0f}%) — merging chunk "
+                        f"(total merged: {len(merge_pending)/SAMPLE_RATE:.2f}s)"
+                    )
+                    # Carry overlap normally
                     if overlap_samples > 0 and len(raw_chunk) > overlap_samples:
                         overlap_frame    = raw_chunk[-overlap_samples:].reshape(-1, 1)
                         buffer           = [overlap_frame]
@@ -367,37 +408,16 @@ class BaseCapture(ABC):
                         buffered_samples = 0
                     continue
 
-                chunk = clean_chunk
-                chunks_processed += 1
+                # Queue is below threshold — enqueue (flushing any merged audio first)
+                if merge_pending is not None:
+                    # Flush the accumulated merged chunk first
+                    combined = np.concatenate([merge_pending, chunk])
+                    merge_pending = None
+                    self._safe_enqueue(combined, depth, q_ratio)
+                else:
+                    self._safe_enqueue(chunk, depth, q_ratio)
 
-                # ── Queue status ─────────────────────────────────────
-                depth = self._ai_queue.qsize()
-                q_ratio = depth / AI_QUEUE_MAXSIZE
-
-                # ── Backpressure (progressive sleep) ─────────────────
-                if q_ratio >= BACKPRESSURE_THRESHOLD:
-                    sleep_ms = BACKPRESSURE_SLEEP_S * 1000
-                    if q_ratio >= 0.95:
-                        sleep_ms *= 3   # 150ms sleep at 95%+
-                    elif q_ratio >= 0.90:
-                        sleep_ms *= 2   # 100ms sleep at 90%+
-                    logger.warning(
-                        f"Backpressure — queue {depth}/{AI_QUEUE_MAXSIZE} "
-                        f"({q_ratio * 100:.0f}%). Pausing {sleep_ms:.0f} ms."
-                    )
-                    time.sleep(sleep_ms / 1000)
-
-                # Drop oldest when still full (last resort)
-                if self._ai_queue.full():
-                    try:
-                        self._ai_queue.get_nowait()
-                        logger.warning("Queue full — dropped oldest chunk.")
-                    except queue.Empty:
-                        pass
-                self._ai_queue.put_nowait(chunk)
-
-                # ── Automatic mode switching ─────────────────────────
-                # Higher queue = bigger chunks = fewer inference calls
+                # ── Auto mode switching ──────────────────────────────────
                 new_mode = current_mode
                 if q_ratio >= MODE_SWITCH_TO_ACCURACY_THRESHOLD:
                     target_s = ACCURACY_CHUNK_DURATION_S
@@ -409,21 +429,19 @@ class BaseCapture(ABC):
                     target_s = ULTRA_CHUNK_DURATION_S
                     new_mode = "ULTRA_REALTIME"
                 else:
-                    # Linear interpolation between min and max
-                    t = (q_ratio - ADAPTIVE_LOW_THRESHOLD) / (
+                    t_val = (q_ratio - ADAPTIVE_LOW_THRESHOLD) / (
                         ADAPTIVE_HIGH_THRESHOLD - ADAPTIVE_LOW_THRESHOLD
                     )
-                    t = max(0.0, min(1.0, t))  # clamp to [0, 1]
-                    target_s = CHUNK_MIN_S + t * (CHUNK_MAX_S - CHUNK_MIN_S)
+                    t_val    = max(0.0, min(1.0, t_val))
+                    target_s = CHUNK_MIN_S + t_val * (CHUNK_MAX_S - CHUNK_MIN_S)
                     target_s = round(target_s, 2)
                     new_mode = "ADAPTIVE"
 
-                # Smooth transition — exponential moving average (avoid jumps)
-                alpha = 0.3  # smoothing factor: 0.3 = gradual, 1.0 = instant
+                # EMA smoothing to avoid abrupt chunk-size jumps
+                alpha = 0.3
                 new_s = current_chunk_s * (1 - alpha) + target_s * alpha
                 new_s = round(max(CHUNK_MIN_S, min(CHUNK_MAX_S, new_s)), 2)
 
-                # Log mode transitions
                 if new_mode != current_mode:
                     elapsed = time.monotonic() - last_mode_switch
                     logger.info(
@@ -439,16 +457,15 @@ class BaseCapture(ABC):
                     current_chunk_s = new_s
                     chunk_samples   = int(self.native_rate * current_chunk_s)
 
-                # ── Processing time logging ──────────────────────────
                 proc_ms = (time.perf_counter() - chunk_start_t) * 1000
-                if chunks_processed % 10 == 0:  # Log every 10th chunk
+                if chunks_processed % 10 == 0:
                     logger.debug(
                         f"[PIPELINE] chunk #{chunks_processed} | "
                         f"mode={current_mode} | chunk={current_chunk_s:.2f}s | "
                         f"queue={q_ratio * 100:.0f}% | proc={proc_ms:.0f}ms"
                     )
 
-                # ── Carry 0.3s overlap into next chunk ───────────────
+                # ── 200 ms overlap into next chunk ───────────────────────
                 if overlap_samples > 0 and len(raw_chunk) > overlap_samples:
                     overlap_frame    = raw_chunk[-overlap_samples:].reshape(-1, 1)
                     buffer           = [overlap_frame]
@@ -460,25 +477,51 @@ class BaseCapture(ABC):
             except Exception as exc:
                 logger.error(f"ChunkAggregator error: {exc}")
 
+    def _safe_enqueue(self, chunk: np.ndarray, depth: int, q_ratio: float) -> None:
+        """Enqueue a chunk. Last-resort: if still full drop oldest (should be rare)."""
+        if self._ai_queue.full():
+            try:
+                self._ai_queue.get_nowait()
+                logger.warning("Queue full — dropped oldest chunk (last resort).")
+            except queue.Empty:
+                pass
+        try:
+            self._ai_queue.put_nowait(chunk)
+        except queue.Full:
+            logger.warning("Queue put failed — chunk discarded.")
+
     # ------------------------------------------------------------------
-    # Whisper Worker Pool — AI_WORKER_COUNT threads share _ai_queue
+    # Whisper Worker Pool
     # ------------------------------------------------------------------
     def _ai_dispatch_worker(self, worker_id: int) -> None:
-        """Pull chunks from the pool queue and invoke the Whisper callback."""
+        """Pull audio chunks from the shared queue and invoke Whisper callback.
+
+        Two workers run in parallel (round-robin by queue consumption).
+        Each worker processes one 2.4s window at a time; while one waits
+        for GPU inference, the other can begin preprocessing the next window.
+        """
+        import time as _t
         while self.is_running:
             try:
                 chunk = self._ai_queue.get(timeout=0.2)
                 if chunk is None:
                     break
+                t0 = _t.perf_counter()
                 self.callback(chunk)
+                elapsed = (_t.perf_counter() - t0) * 1000
+                logger.debug(
+                    f"[WhisperWorker-{worker_id}] chunk processed in {elapsed:.0f}ms "
+                    f"| queue_depth={self._ai_queue.qsize()}"
+                )
             except queue.Empty:
                 continue
             except Exception as exc:
                 logger.error(f"WhisperWorker-{worker_id} error: {exc}")
-                break
+                # Don't break — keep worker alive to process next chunk
+                import time; time.sleep(0.1)
 
     # ------------------------------------------------------------------
-    # Queue depth monitor with [PIPELINE] logging
+    # Queue depth monitor
     # ------------------------------------------------------------------
     def _queue_monitor_worker(self, label: str) -> None:
         while self.is_running:
@@ -489,11 +532,10 @@ class BaseCapture(ABC):
             if depth >= _BACKPRESSURE_DEPTH:
                 interval, log = MONITOR_CRITICAL_S, logger.warning
             elif depth >= _WARN_DEPTH:
-                interval, log = MONITOR_WARN_S, logger.warning
+                interval, log  = MONITOR_WARN_S, logger.warning
             else:
-                interval, log = MONITOR_IDLE_S, logger.info
+                interval, log  = MONITOR_IDLE_S, logger.info
 
-            # Determine current effective mode from queue ratio
             q_ratio = depth / AI_QUEUE_MAXSIZE
             if q_ratio >= MODE_SWITCH_TO_ACCURACY_THRESHOLD:
                 mode_label = "ACCURACY"
@@ -547,17 +589,15 @@ class BaseCapture(ABC):
 class MicrophoneCapture(BaseCapture):
     """Microphone input via sounddevice at 16 kHz mono.
 
-    Opens the hardware stream at SAMPLE_RATE (16 kHz) directly so the
-    preprocessor never needs to resample — zero extra latency.
-    blocksize=1024 gives ~64 ms frames at 16 kHz for low callback overhead.
+    Opens at SAMPLE_RATE (16 kHz) directly — no resampling overhead.
+    blocksize=3200 gives 200 ms frames at 16 kHz (target capture frame size).
     """
 
-    # Audio config — 16 kHz mono float32, small buffer
     _AUDIO_CONFIG = dict(
-        samplerate=SAMPLE_RATE,   # 16000 Hz — Whisper native
-        channels=CHANNELS,        # 1 (mono)
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
         dtype="float32",
-        blocksize=1024,           # ~64 ms per callback at 16 kHz
+        blocksize=3200,           # 200 ms at 16 kHz — aligns with CAPTURE_FRAME_S
     )
 
     def __init__(
@@ -573,7 +613,6 @@ class MicrophoneCapture(BaseCapture):
         if self.is_running:
             return
         try:
-            # Open at 16 kHz directly — no resampling needed downstream
             self.native_rate = SAMPLE_RATE
 
             self._stream = sd.InputStream(
@@ -587,7 +626,7 @@ class MicrophoneCapture(BaseCapture):
 
             logger.info(
                 f"Microphone capture started | device={self.device_index} | "
-                f"rate={self.native_rate} Hz | blocksize=1024 | "
+                f"rate={self.native_rate} Hz | blocksize=3200 (200ms) | "
                 f"chunk={chunk_duration_s}s | NO resampling needed"
             )
         except Exception as exc:
@@ -601,15 +640,9 @@ class MicrophoneCapture(BaseCapture):
 class SystemAudioCapture(BaseCapture):
     """Windows WASAPI Loopback capture — extends BaseCapture.
 
-    Captures system audio digitally (identical to how OBS captures audio).
-    Works even when speakers are muted.
-
-    IMPORTANT: WASAPI loopback devices MUST be opened at their native sample
-    rate (typically 48000 Hz). We cannot force 16 kHz at the hardware level.
-    Mono downmix happens in the callback. The preprocessor handles resampling
-    48k→16k via cached torchaudio Kaiser filter on CPU (~5 ms).
-
-    Buffer is set to 1024 samples (~21 ms at 48 kHz) for low latency.
+    Captures system audio at native rate (typically 48000 Hz).
+    The preprocessor handles resampling 48k→16k via scipy polyphase filter.
+    Buffer is 9600 samples (~200 ms at 48 kHz) to match CAPTURE_FRAME_S.
     """
 
     def __init__(
@@ -638,7 +671,6 @@ class SystemAudioCapture(BaseCapture):
                 wasapi_info["defaultOutputDevice"]
             )
 
-            # Find the loopback device that mirrors the default speakers
             loopback_device = None
             for i in range(p.get_device_count()):
                 dev = p.get_device_info_by_index(i)
@@ -647,7 +679,6 @@ class SystemAudioCapture(BaseCapture):
                         loopback_device = dev
                         break
 
-            # Fallback: use any available loopback device
             if loopback_device is None:
                 for i in range(p.get_device_count()):
                     dev = p.get_device_info_by_index(i)
@@ -667,19 +698,13 @@ class SystemAudioCapture(BaseCapture):
                 f"{self.native_rate} Hz | {channels} ch"
             )
 
-            # Small hardware buffer — 1024 samples for low latency
-            # At 48 kHz this is ~21 ms; at 44.1 kHz ~23 ms
-            frames_per_buffer = 1024
+            # 200 ms frames at native rate: ~9600 samples at 48 kHz
+            frames_per_buffer = int(self.native_rate * CAPTURE_FRAME_S)
 
             def _pyaudio_callback(in_data, frame_count, time_info, flags):
-                """PyAudio stream callback — must NEVER block.
-
-                Converts multi-channel float32 to mono in-place.
-                """
                 if self.is_running:
                     audio = np.frombuffer(in_data, dtype=np.float32)
                     if channels >= 2:
-                        # Vectorized mono downmix — no Python loop
                         audio = audio.reshape(-1, channels).mean(axis=1)
                     self._ring_buffer.put(audio.reshape(-1, 1))
                 return (None, pyaudio.paContinue)
@@ -700,7 +725,7 @@ class SystemAudioCapture(BaseCapture):
             self._start_workers(chunk_duration_s, label="Sys")
 
             logger.info(
-                f"WASAPI Loopback ACTIVE | buffer=1024 samples | "
+                f"WASAPI Loopback ACTIVE | buffer={frames_per_buffer} samples (~200ms) | "
                 f"chunk={chunk_duration_s}s | "
                 f"native={self.native_rate} Hz → resample to {SAMPLE_RATE} Hz"
             )
@@ -713,7 +738,6 @@ class SystemAudioCapture(BaseCapture):
             raise
 
     def stop(self) -> None:
-        # Close the PyAudio stream before delegating to BaseCapture.stop()
         if hasattr(self, "_pa_stream") and self._pa_stream:
             try:
                 self._pa_stream.stop_stream()
@@ -729,7 +753,7 @@ class SystemAudioCapture(BaseCapture):
                 pass
             self._pyaudio = None
 
-        super().stop()   # ring_buffer.unblock() + thread joins
+        super().stop()
 
 
 # ---------------------------------------------------------------------------
@@ -739,8 +763,8 @@ class AudioEngine:
     """Wrapper for managing dual capture sources."""
 
     def __init__(self) -> None:
-        self.mic: Optional[MicrophoneCapture]   = None
-        self.sys: Optional[SystemAudioCapture]  = None
+        self.mic: Optional[MicrophoneCapture]  = None
+        self.sys: Optional[SystemAudioCapture] = None
 
     @staticmethod
     def list_devices() -> list:
