@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 TARGET_SR            = 16_000   # Whisper requires 16 kHz mono
 TARGET_RMS           = 0.1      # RMS normalization target (~-20 dBFS)
-NOISE_GATE_RMS       = 0.003    # Silence threshold — below this is silence
+NOISE_GATE_RMS       = 0.001    # Reduced for accuracy mode — catches softer speech
 # v8: tightened latency budgets
 LATENCY_WARN_MS      = 30    # Standard path budget (ms)  — was 80
 FAST_PATH_WARN_MS    = 5     # Ultra-fast path budget (ms) — was 30

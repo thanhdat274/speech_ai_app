@@ -31,13 +31,14 @@ from faster_whisper import WhisperModel
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Rolling context window config
+# Rolling context window config — Optimized for Vietnamese accuracy
 # ---------------------------------------------------------------------------
-_CONTEXT_WINDOW_S  = 15.0   # Rolling 15-second context for grammar continuity
-_CONTEXT_MAX_WORDS = 150    # Word budget within the Whisper prompt limit (~224 tokens)
+_CONTEXT_WINDOW_S  = 30.0   # Increased from 15s — longer context for grammar continuity
+_CONTEXT_MAX_WORDS = 250    # Increased from 150 — more context words for Vietnamese
 
 # Inference timeout — Whisper must not block the pipeline longer than this
-_INFERENCE_TIMEOUT_S = 8.0
+# Increased for accuracy mode with large-v3 model
+_INFERENCE_TIMEOUT_S = 15.0  # Increased from 8s for large-v3 inference
 
 
 class AIEngine:
@@ -83,6 +84,9 @@ class AIEngine:
                 max_workers=1, thread_name_prefix="whisper-infer"
             )
 
+            # --- Accuracy mode flag ---
+            self.accuracy_mode: bool = False
+
             # --- Hardware state ---
             self.device: str = "cpu"
             self.compute_type: str = "int8"
@@ -103,6 +107,42 @@ class AIEngine:
                 "Nội dung có thể bao gồm công nghệ, giáo dục, podcast, review sản phẩm."
             )
 
+            # --- Int4 quantization support ---
+            self._int4_available = False
+            try:
+                import bitsandbytes
+                self._int4_available = True
+                logger.info("bitsandbytes detected - int4 quantization available")
+            except ImportError:
+                logger.info("bitsandbytes not installed - int4 not available")
+
+            # Topic hotwords dictionary
+            self._topic_keywords = {
+                "technology": [
+                    "AI", "machine learning", "deep learning", "neural network",
+                    "Python", "programming", "software", "algorithm",
+                    "blockchain", "cryptocurrency", "cloud", "database",
+                    "mô hình", "huấn luyện", "dữ liệu"
+                ],
+                "education": [
+                    "học tập", "giảng dạy", "trường học", "bài học", "giáo dục",
+                    "sinh viên", "giáo viên", "university", "college",
+                    "học viện", "kiến thức"
+                ],
+                "business": [
+                    "kinh doanh", "doanh nghiệp", "đầu tư", "thị trường",
+                    "lợi nhuận", "bán hàng", "marketing", "startup",
+                    "revenue", "sales", "investment"
+                ],
+                "entertainment": [
+                    "phim", "âm nhạc", "ca sĩ", "ca khúc", "review",
+                    "game", "trò chơi", "streaming", "movie", "music"
+                ]
+            }
+
+            # Detected topics for current session
+            self._detected_topics: set = set()
+
     # ------------------------------------------------------------------
     # Hardware detection
     # ------------------------------------------------------------------
@@ -117,10 +157,16 @@ class AIEngine:
             self.device = "cuda"
             self.vram_gb = props.total_memory / (1024 ** 3)
 
-            # v9 req #6: float16 for GTX 1650 Ti (Turing Tensor Cores, 4 GB VRAM)
-            # float16 gives higher GPU utilisation than int8_float16 on Turing.
-            # Fall back to int8_float16 only on cards with < 3 GB VRAM.
-            self.compute_type = "float16" if self.vram_gb >= 3.0 else "int8_float16"
+            # Updated compute type logic with int4 support
+            if self.vram_gb >= 6.0:
+                self.compute_type = "float16"
+            elif self.vram_gb >= 3.0:
+                self.compute_type = "int8_float16"
+            elif self._int4_available:
+                self.compute_type = "int4"
+            else:
+                self.compute_type = "int8_float16"
+
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -143,24 +189,46 @@ class AIEngine:
     # Model auto-selection
     # ------------------------------------------------------------------
     def _auto_select_whisper_model(self) -> str:
+        target_lang = "None (Off)"
+        ultra_realtime = self.ultra_realtime_mode
+        accuracy_mode = self.accuracy_mode
+
         try:
             from core.config_manager import ConfigManager
-            override = ConfigManager().get("whisper_model_override", "")
+            cfg = ConfigManager()
+            override = cfg.get("whisper_model_override", "")
+            target_lang = cfg.get("target_lang", target_lang)
+            ultra_realtime = cfg.get("ultra_realtime_mode", ultra_realtime)
+            accuracy_mode = cfg.get("accuracy_mode", False)
             if override and override not in ("", "Auto", "Auto (Recommended)"):
                 logger.info(f"Model override from config: '{override}'")
                 return override
         except Exception:
             pass
 
+        # Accuracy mode and ultra-realtime pull in opposite directions.
+        if accuracy_mode:
+            ultra_realtime = False
+
         if self.device == "cpu":
-            selected = "base"
+            selected = "medium" if accuracy_mode else "base"
         else:
-            # large-v3 fits ~3 GB VRAM with int8_float16 — fine even on GTX 1650
-            selected = "large-v3"
+            translation_enabled = bool(target_lang and target_lang != "None (Off)")
+
+            if accuracy_mode and self.vram_gb >= 3.0:
+                selected = "large-v3"
+            elif self.vram_gb <= 4.5:
+                selected = "small"
+            elif self.vram_gb <= 6.0:
+                selected = "medium" if (translation_enabled or ultra_realtime) else "large-v3-turbo"
+            else:
+                selected = "large-v3-turbo" if ultra_realtime else "large-v3"
 
         logger.info(
             f"Auto-selected model: '{selected}' "
-            f"(device={self.device}, VRAM={self.vram_gb:.1f} GB)"
+            f"(device={self.device}, VRAM={self.vram_gb:.1f} GB, "
+            f"accuracy_mode={accuracy_mode}, ultra_realtime={ultra_realtime}, "
+            f"translation={'on' if target_lang and target_lang != 'None (Off)' else 'off'})"
         )
         return selected
 
@@ -172,7 +240,18 @@ class AIEngine:
         if not model_size or any(kw in model_size for kw in ("Auto", "Recommended", "auto")):
             model_size = self._auto_select_whisper_model()
 
-        effective_compute = self.compute_type
+        # Override compute type if user preference exists
+        try:
+            from core.config_manager import ConfigManager
+            cfg = ConfigManager()
+            force_int4 = cfg.get("force_int4_quantization", False)
+        except:
+            force_int4 = False
+
+        if force_int4 and self._int4_available and self.device == "cuda":
+            effective_compute = "int4"
+        else:
+            effective_compute = self.compute_type
 
         with self._lock:
             if not force_reload and self._whisper_model and self._whisper_model_name == model_size:
@@ -193,66 +272,123 @@ class AIEngine:
                 f"VRAM={self.vram_gb:.1f} GB"
             )
             try:
-                num_workers = 4 if self.device == "cuda" else 2
-                self._whisper_model = WhisperModel(
-                    model_size,
-                    device=self.device,
-                    compute_type=effective_compute,
-                    cpu_threads=6,
-                    num_workers=num_workers,
-                    download_root=None,
-                    local_files_only=False,
-                )
-
-                self._whisper_model_name = model_size
-
-                # BatchedInferencePipeline — SECTION 3 compliance:
-                #   VRAM < 6 GB  → batch_size = 8
-                #   VRAM >= 6 GB → batch_size = 16
-                # v9: BatchedInferencePipeline DISABLED for streaming.
-                # BatchedInferencePipeline waits to accumulate a full batch
-                # before running inference, adding 500ms+ of artificial latency
-                # at normal audio rates. For real-time streaming with 2.4s
-                # windows we use standard sequential inference instead.
-                # Re-enable only for file transcription (non-realtime) workloads.
-                self._batched_pipeline = None
-                self._batch_size       = 1
-                logger.info(
-                    f"[AIEngine] BatchedInferencePipeline disabled for RT streaming | "
-                    f"using sequential inference | VRAM={self.vram_gb:.1f} GB"
-                )
-
-                logger.info(
-                    f"Whisper '{model_size}' ready | "
-                    f"{self.device.upper()} | {effective_compute}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to load Whisper '{model_size}': {e}")
-                if model_size != "tiny":
-                    logger.warning("Falling back to 'tiny' model.")
-                    self.load_whisper("tiny", force_reload=True)
+                if effective_compute == "int4":
+                    self._load_int4_model(model_size)
                 else:
-                    raise
+                    self._load_standard_model(model_size, effective_compute)
+            except Exception as e:
+                logger.warning(f"{effective_compute} failed: {e}")
+                logger.warning("Falling back to int8_float16...")
+                self._load_standard_model(model_size, "int8_float16")
+
+    # ------------------------------------------------------------------
+    # Int4 model loading
+    # ------------------------------------------------------------------
+    def _load_int4_model(self, model_size: str) -> None:
+        """Load Whisper model with int4 quantization via bitsandbytes."""
+        from faster_whisper import WhisperModel
+
+        logger.info(f"Loading Whisper '{model_size}' with int4 quantization...")
+
+        self._whisper_model = WhisperModel(
+            model_size,
+            device=self.device,
+            compute_type="int4_float16",  # bitsandbytes int4
+            cpu_threads=4,
+            num_workers=2,
+            download_root=None,
+            local_files_only=False,
+        )
+
+        self._whisper_model_name = model_size
+        self._batched_pipeline = None
+        self._batch_size = 1
+
+        logger.info(
+            f"Whisper '{model_size}' loaded with int4 | "
+            f"CUDA | int4_float16 | VRAM={self.vram_gb:.1f} GB"
+        )
+
+    def _load_standard_model(self, model_size: str, compute_type: str) -> None:
+        """Load Whisper model with standard quantization."""
+        from faster_whisper import WhisperModel
+
+        logger.info(f"Loading Whisper '{model_size}' | {compute_type}...")
+
+        num_workers = 4 if self.device == "cuda" else 2
+
+        self._whisper_model = WhisperModel(
+            model_size,
+            device=self.device,
+            compute_type=compute_type,
+            cpu_threads=6,
+            num_workers=num_workers,
+            download_root=None,
+            local_files_only=False,
+        )
+
+        self._whisper_model_name = model_size
+        self._batched_pipeline = None
+        self._batch_size = 1
+
+        logger.info(
+            f"Whisper '{model_size}' loaded | "
+            f"{self.device.upper()} | {compute_type}"
+        )
 
     # ------------------------------------------------------------------
     # Language / prompt helpers
     # ------------------------------------------------------------------
     def _resolve_language(self, language: Optional[str]) -> Optional[str]:
-        """Return the language code to pass to Whisper."""
-        if language == "vi":
-            return "vi"
-        if not self.force_language:
+        """Return the language code to pass to Whisper.
+
+        Respect an explicit UI language selection even when force_language is
+        disabled. Auto-detect should only happen when the caller actually
+        passes no language (for example "Auto-Detect" -> None).
+        """
+        if not language:
             return None
+
+        # An explicit language choice should stay explicit for low-latency
+        # streaming sessions. Falling back to auto-detect here makes English
+        # and other selected languages feel noticeably slower.
         return language
 
     def _build_prompt(self, language: Optional[str], user_prompt: str) -> str:
-        """Build the initial_prompt for Whisper with Vietnamese base if needed."""
+        """Build prompt with detected topic hotwords."""
         if language == "vi":
             base = self.vi_base_prompt.strip()
+
+            # Add detected topics
+            if self._detected_topics:
+                topic_keywords = []
+                for topic in self._detected_topics:
+                    topic_keywords.extend(self._topic_keywords.get(topic, []))
+
+                if topic_keywords:
+                    base += f"\nTừ khóa chuyên ngành: {', '.join(topic_keywords[:10])}"
+
             if user_prompt:
                 return f"{base} {user_prompt.strip()}"
             return base
+
         return user_prompt
+
+    # ------------------------------------------------------------------
+    # Topic detection
+    # ------------------------------------------------------------------
+    def _detect_topics(self, text: str) -> set:
+        """Detect topics from text using keyword matching."""
+        detected = set()
+        text_lower = text.lower()
+
+        for topic, keywords in self._topic_keywords.items():
+            for keyword in keywords:
+                if keyword.lower() in text_lower:
+                    detected.add(topic)
+                    break
+
+        return detected
 
     # ------------------------------------------------------------------
     # Core transcription (with timeout protection)
@@ -284,8 +420,16 @@ class AIEngine:
 
         effective_language = self._resolve_language(language)
         effective_prompt = self._build_prompt(language, prompt)
+        carry_context = not self.ultra_realtime_mode
 
         is_vietnamese = (effective_language == "vi")
+
+        if self.accuracy_mode:
+            beam_size = 5
+            best_of = 5
+        else:
+            beam_size = 1
+            best_of = 1
 
         if is_vietnamese:
             tech_hotwords = (
@@ -293,17 +437,16 @@ class AIEngine:
                 "machine learning, công nghệ, lập trình"
             )
             _transcribe_kwargs = dict(
-                # v9 req #5: beam_size=1/best_of=1 for realtime latency target
-                # beam_size=5 was the primary cause of 8-10s end-to-end latency.
-                # For streaming windows (2.4s) greedy decoding is fast enough.
-                beam_size=1,
-                best_of=1,
-                temperature=0,
+                # beam_size=5, best_of=5 for accuracy mode (beam search)
+                # beam_size=1 for ultra realtime (greedy decoding)
+                beam_size=beam_size,
+                best_of=best_of,
+                temperature=0.0,
                 language=effective_language,
                 initial_prompt=effective_prompt,
                 hotwords=tech_hotwords,
-                word_timestamps=True,
-                condition_on_previous_text=True,   # req #5
+                word_timestamps=False,
+                condition_on_previous_text=carry_context,
                 repetition_penalty=1.1,
                 vad_filter=False,
                 no_speech_threshold=0.6,
@@ -312,12 +455,12 @@ class AIEngine:
             )
         else:
             _transcribe_kwargs = dict(
-                beam_size=1,
-                best_of=1,
-                temperature=0,
+                beam_size=beam_size,
+                best_of=best_of,
+                temperature=0.0,
                 language=effective_language,
                 initial_prompt=effective_prompt,
-                condition_on_previous_text=True,   # req #5: context continuity
+                condition_on_previous_text=carry_context,
                 vad_filter=False,
                 no_speech_threshold=0.6,
                 log_prob_threshold=-1.0,
@@ -358,6 +501,21 @@ class AIEngine:
         except Exception as e:
             logger.error(f"Whisper inference error: {e}")
             return {"text": "", "language": language}
+
+        # ── First chunk: detect topics ──────────────────────────────────
+        if not self._detected_topics and segments:
+            # Collect sample text from first few segments
+            sample_parts = []
+            for seg in list(segments)[:5]:  # First 5 segments
+                sample_parts.append(seg.text)
+                if len(sample_parts) >= 5:
+                    break
+
+            sample_text = " ".join(sample_parts)
+            self._detected_topics = self._detect_topics(sample_text)
+
+            if self._detected_topics:
+                logger.info(f"Detected topics: {self._detected_topics}")
 
         # ── Per-segment hallucination filters ────────────────────────────
         raw_text_parts: List[str] = []
@@ -407,7 +565,8 @@ class AIEngine:
                 continue
 
             # Filter 6: Similarity > 0.9 with last_text (SequenceMatcher)
-            if self.last_text:
+            # Disabled in accuracy mode to avoid dropping valid repeated phrases.
+            if self.last_text and not self.accuracy_mode:
                 similarity = difflib.SequenceMatcher(
                     None, seg_text.lower(), self.last_text.lower()
                 ).ratio()
@@ -442,6 +601,13 @@ class AIEngine:
             "cảm ơn bạn", "cảm ơn các bạn", "cảm ơn bạn đã theo dõi",
             "xin chào các bạn", "chào mừng các bạn",
             "thank you", "thanks for watching",
+            "チャンネル登録", "ご視聴", "ありがとうございます", "高評価",
+            "구독", "좋아요", "시청해주셔서", "감사합니다",
+            "订阅", "请按赞", "谢谢观看", "观看",
+            "suscríbete", "gracias por ver", "dale like",
+            "merci de regarder", "abonnez-vous",
+            "vielen dank", "abonnieren",
+            "amara.org", "youtube.com", "subtitles by",
         ]
 
         low_text = refined_text.lower().strip()
@@ -462,7 +628,9 @@ class AIEngine:
                     refined_text = match.group(1).strip()
 
         # D. Duplicate subtitle filter (rolling window with SequenceMatcher)
-        if refined_text and not self.ultra_realtime_mode:
+        # Accuracy mode keeps repeated text because speeches/news can contain
+        # legitimate parallel phrasing that looks duplicate to heuristics.
+        if refined_text and not self.ultra_realtime_mode and not self.accuracy_mode:
             if self._is_duplicate(refined_text):
                 refined_text = ""
             else:

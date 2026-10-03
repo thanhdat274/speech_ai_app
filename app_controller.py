@@ -128,11 +128,16 @@ class LiveStreamingWorker(QObject):
         from core.sentence_builder import SentenceBuilder
 
         self._sys_sentence_builder = SentenceBuilder(
-            on_sentence=lambda text: self._on_sentence_ready("SYS", text)
+            on_sentence=lambda text: self._on_sentence_ready("SYS", text, False),
+            on_partial=lambda text: self._on_sentence_ready("SYS", text, True)
         )
         self._mic_sentence_builder = SentenceBuilder(
-            on_sentence=lambda text: self._on_sentence_ready("MIC", text)
+            on_sentence=lambda text: self._on_sentence_ready("MIC", text, False),
+            on_partial=lambda text: self._on_sentence_ready("MIC", text, True)
         )
+        import time
+        self._last_sys_partial = 0.0
+        self._last_mic_partial = 0.0
 
         # ── StreamingTranslators — one per source ─────────────────────────
         # Created here; activated in start() once we know src/tgt NLLB codes.
@@ -145,11 +150,14 @@ class LiveStreamingWorker(QObject):
     def start(self) -> None:
         try:
             # ── Chunk size by latency mode ────────────────────────────────
-            if self._ai.ultra_realtime_mode:
-                chunk_s    = ULTRA_CHUNK_DURATION_S   # 1.2 s
-                mode_label = "ULTRA_REALTIME (1.2s, stride-preprocess)"
+            if getattr(self._ai, "accuracy_mode", False):
+                chunk_s    = ACCURACY_CHUNK_DURATION_S
+                mode_label = f"ACCURACY ({ACCURACY_CHUNK_DURATION_S}s)"
+            elif self._ai.ultra_realtime_mode:
+                chunk_s    = ULTRA_CHUNK_DURATION_S
+                mode_label = f"ULTRA_REALTIME ({ULTRA_CHUNK_DURATION_S}s, stride-preprocess)"
             else:
-                chunk_s    = BALANCED_CHUNK_DURATION_S  # 1.0 s
+                chunk_s    = BALANCED_CHUNK_DURATION_S
                 mode_label = f"BALANCED ({BALANCED_CHUNK_DURATION_S}s)"
 
             logger.info(f"[LiveWorker] Starting — mode={mode_label}")
@@ -171,14 +179,14 @@ class LiveStreamingWorker(QObject):
                 # Create per-source StreamingTranslators
                 self._sys_streaming_translator = StreamingTranslator(
                     translator_engine = self._translator_eng,
-                    callback = lambda t: self._on_translation("SYS", t),
+                    callback = lambda t, p=False: self._on_translation("SYS", t, p),
                     src_lang = src_nllb,
                     tgt_lang = target_nllb,
                     label    = "SYS",
                 )
                 self._mic_streaming_translator = StreamingTranslator(
                     translator_engine = self._translator_eng,
-                    callback = lambda t: self._on_translation("MIC", t),
+                    callback = lambda t, p=False: self._on_translation("MIC", t, p),
                     src_lang = src_nllb,
                     tgt_lang = target_nllb,
                     label    = "MIC",
@@ -258,11 +266,6 @@ class LiveStreamingWorker(QObject):
     # STT text handler — raw Whisper output
     # ------------------------------------------------------------------
     def _handle_text(self, source: str, text: str) -> None:
-        """Raw Whisper output → UI + SentenceBuilder.
-
-        Stage latency logged at DEBUG level.
-        NO disk I/O here — realtime hot path must stay lightweight (req #8/#9).
-        """
         import time as _time
         if not self._is_running:
             return
@@ -271,39 +274,30 @@ class LiveStreamingWorker(QObject):
         if len(clean) < 2:
             return
 
+        is_partial = clean.startswith("…")
+        if is_partial:
+            clean = clean.lstrip("…").strip()
+
         t_recv = _time.perf_counter()
 
-        # ── Immediate raw STT emission → UI (white text, no delay) ──────────
         self.chunk_result.emit({
             "speakers": [(source, clean)],
             "text":     clean,
-            "type":     "partial",
+            "is_partial": is_partial,
+            "type":     "partial" if is_partial else "stable",
         })
 
-        # ── SentenceBuilder: accumulate until boundary ────────────────────
-        # transcript_buf.append() is called in _on_sentence_ready (complete
-        # sentences only) — NOT on every partial chunk. (req #8/#9)
         sb = (
             self._sys_sentence_builder if source == "SYS"
             else self._mic_sentence_builder
         )
-        if sb is not None:
+        if sb is not None and not is_partial:
             sb.add_partial(clean)
 
-        logger.debug(
-            f"[Pipeline:{source}] STT recv | "
-            f"words={len(clean.split())} | "
-            f"emit+sb_feed={(_time.perf_counter()-t_recv)*1000:.1f}ms | "
-            f"{clean[:40]!r}"
-        )
+        logger.debug(f"[Pipeline:{source}] STT recv [partial={is_partial}] | {clean[:40]!r}")
 
-    def _on_sentence_ready(self, source: str, sentence: str) -> None:
-        """Complete sentence from SentenceBuilder → TranscriptBuffer + StreamingTranslator.
-
-        v9: transcript_buf.append() happens HERE (complete sentences only)
-        so the realtime STT hot path has zero I/O. The in-memory buffer is
-        O(1), and the async FileWriter thread handles disk persistence.
-        """
+    def _on_sentence_ready(self, source: str, sentence: str, is_partial: bool = False) -> None:
+        import time
         if not self._is_running:
             return
 
@@ -311,10 +305,18 @@ class LiveStreamingWorker(QObject):
         if not sentence:
             return
 
-        logger.debug(f"[LiveWorker] Sentence ready [{source}]: {sentence!r}")
-
-        # ── Persist sentence to in-memory buffer (async file write off-thread) ─
-        self._transcript_buf.append(sentence)
+        if is_partial:
+            # Throttle partial translations to max 1 per 600ms
+            now = time.monotonic()
+            if source == "SYS":
+                if now - getattr(self, "_last_sys_partial", 0) < 0.6: return
+                self._last_sys_partial = now
+            else:
+                if now - getattr(self, "_last_mic_partial", 0) < 0.6: return
+                self._last_mic_partial = now
+        else:
+            logger.debug(f"[LiveWorker] Sentence ready [{source}]: {sentence!r}")
+            self._transcript_buf.append(sentence)
 
         st = (
             self._sys_streaming_translator if source == "SYS"
@@ -327,18 +329,19 @@ class LiveStreamingWorker(QObject):
             import threading
             threading.Thread(
                 target=st.feed,
-                args=(sentence,),
+                args=(sentence, is_partial),
                 daemon=True,
                 name=f"StreamTrans-{source}",
             ).start()
 
-    def _on_translation(self, source: str, translated: str) -> None:
+    def _on_translation(self, source: str, translated: str, is_partial: bool = False) -> None:
         """Translation result from StreamingTranslator → Signal → UI."""
         if not self._is_running or not translated.strip():
             return
         self.translation_result.emit({
             "source":     source,
             "translated": translated,
+            "is_partial": is_partial,
         })
 
 
@@ -414,12 +417,21 @@ class AppController(QObject):
         _cfg = ConfigManager()
         self.ai_engine.force_language      = _cfg.get("force_language", True)
         self.ai_engine.vi_base_prompt      = _cfg.get("vi_base_prompt", self.ai_engine.vi_base_prompt)
-        self.ai_engine.ultra_realtime_mode = _cfg.get("ultra_realtime_mode", False)
+        self.ai_engine.accuracy_mode       = _cfg.get("accuracy_mode", False)
+        self.ai_engine.ultra_realtime_mode = (
+            False if self.ai_engine.accuracy_mode
+            else _cfg.get("ultra_realtime_mode", False)
+        )
 
-        if self.ai_engine.ultra_realtime_mode:
+        if self.ai_engine.accuracy_mode:
+            logger.info(
+                "Accuracy Mode ENABLED — larger chunks, full context memory, "
+                "heavier Whisper decode."
+            )
+        elif self.ai_engine.ultra_realtime_mode:
             logger.info(
                 "Ultra Realtime Mode ENABLED — "
-                "chunk=1.2s, stride-preprocess, no context memory."
+                f"chunk={ULTRA_CHUNK_DURATION_S}s, stride-preprocess, no context memory."
             )
 
         # v8: NLLB model preload was triggered in TranslationEngine.__init__.
@@ -523,6 +535,7 @@ class AppController(QObject):
         """
         translated = data.get("translated", "").strip()
         source     = data.get("source", "TR")
+        is_partial = data.get("is_partial", False)
         if not translated:
             return
         self.translation_ready.emit({
@@ -530,6 +543,7 @@ class AppController(QObject):
             "translated": translated,
             "text":       translated,
             "source":     source,
+            "is_partial": is_partial,
         })
 
     # ------------------------------------------------------------------

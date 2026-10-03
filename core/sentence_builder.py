@@ -39,8 +39,8 @@ from typing import Callable, List, Optional
 # ─────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────
-_SENTENCE_ENDINGS    = re.compile(r'[.!?…;:]\s*$')      # Ends with punctuation
-_MID_SENTENCE_SPLIT  = re.compile(r'[.!?…;:]\s+')       # Punctuation + space mid-text
+_SENTENCE_ENDINGS    = re.compile(r'[.!?…;:]\s*$|[。！？；：]\s*$')      # Ends with punctuation
+_MID_SENTENCE_SPLIT  = re.compile(r'[.!?…;:]\s+|[。！？；：]\s*')       # Punctuation + space mid-text, or CJK punctuation
 _VIETNAMESE_ENDINGS  = re.compile(r'[.!?…]\s*$')         # Vietnamese sentence enders
 
 # v9: flush thresholds (req #2)
@@ -72,10 +72,12 @@ class SentenceBuilder:
     def __init__(
         self,
         on_sentence: Callable[[str], None],
+        on_partial: Callable[[str], None] = None,
         pause_threshold_s: float = PAUSE_THRESHOLD_S,
         max_words: int = MAX_WORDS,
     ) -> None:
         self._on_sentence = on_sentence
+        self._on_partial = on_partial
         self._pause_threshold_s = pause_threshold_s
         self._max_words = max_words
 
@@ -125,6 +127,10 @@ class SentenceBuilder:
             # ── Check word count threshold ───────────────────────────────────
             if len(self._buffer.split()) >= self._max_words:
                 self._emit_buffer()
+            else:
+                # ── Output partial draft if we have enough words ───────────
+                if self._on_partial and len(self._buffer.split()) >= MIN_WORDS_TO_EMIT:
+                    self._on_partial(self._buffer)
 
             # ── Restart pause timer (1.2 s before flush) ────────────────────
             self._restart_timer()

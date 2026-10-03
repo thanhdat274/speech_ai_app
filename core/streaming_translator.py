@@ -66,9 +66,82 @@ from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+class BatchAccumulator:
+    """Accumulates sentences until batch threshold is reached."""
+
+    def __init__(self, max_batch_size: int = 4, flush_timeout_s: float = 0.3):
+        self._buffer: List[str] = []
+        self._max_batch_size = max_batch_size
+        self._flush_timeout_s = flush_timeout_s
+        self._last_sentence_time: float = 0
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+
+    def add_sentence(self, sentence: str) -> Optional[List[str]]:
+        """Add sentence, return batch if ready (or None to accumulate)."""
+        with self._lock:
+            self._buffer.append(sentence)
+            self._last_sentence_time = time.monotonic()
+
+            # Check if batch is ready
+            if len(self._buffer) >= self._max_batch_size:
+                batch = self._buffer.copy()
+                self._buffer = []
+                self._cancel_timer()
+                return batch
+
+            # Start/restart flush timer
+            self._restart_timer()
+            return None
+
+    def flush_immediate(self) -> Optional[List[str]]:
+        """Force flush accumulated sentences."""
+        with self._lock:
+            self._cancel_timer()
+            if self._buffer:
+                batch = self._buffer.copy()
+                self._buffer = []
+                return batch
+            return None
+
+    def should_flush(self) -> bool:
+        """Check if flush timer has expired."""
+        with self._lock:
+            if not self._buffer:
+                return False
+            elapsed = time.monotonic() - self._last_sentence_time
+            return elapsed >= self._flush_timeout_s
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _restart_timer(self) -> None:
+        """Restart flush timer. Must hold self._lock."""
+        self._cancel_timer()
+        self._timer = threading.Timer(
+            self._flush_timeout_s, self._on_flush_timeout
+        )
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _cancel_timer(self) -> None:
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    def _on_flush_timeout(self) -> None:
+        """Callback when flush timeout is reached."""
+        pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Batch translation config
+_BATCH_MAX_SIZE      = 4           # Accumulate 4 sentences before batch
+_BATCH_FLUSH_TIMEOUT_S = 0.3       # Flush after 300ms of inactivity
 
 # Rolling context window — keep last N translated sentences as NLLB hint
 _CONTEXT_KEEP_SENTENCES = 5
@@ -118,7 +191,7 @@ class TranslationOutputSmoother:
 
     def __init__(
         self,
-        callback: Callable[[str], None],
+        callback: Callable[[str, bool], None],
         debounce_s: float = _SMOOTHER_DEBOUNCE_S,
         min_words: int = _SMOOTHER_MIN_WORDS,
     ) -> None:
@@ -258,7 +331,7 @@ class StreamingTranslator:
     def __init__(
         self,
         translator_engine,
-        callback: Callable[[str], None],
+        callback: Callable[[str, bool], None],
         src_lang: str = "vie_Latn",
         tgt_lang: str = "eng_Latn",
         label: str = "SRC",
@@ -269,6 +342,9 @@ class StreamingTranslator:
 
         self._src_lang = src_lang
         self._tgt_lang = tgt_lang
+        self._raw_callback = callback
+        
+        self._raw_callback = callback
 
         # Rolling context: deque of (src_sentence, translated_sentence)
         # Used to build a soft hint for NLLB across chunk boundaries
@@ -277,10 +353,17 @@ class StreamingTranslator:
         # Output smoother — dedup + debounce translated output
         self._smoother = TranslationOutputSmoother(callback=callback)
 
+        # Batch accumulator for GPU-efficient translation
+        self._batch_accumulator = BatchAccumulator(
+            max_batch_size=_BATCH_MAX_SIZE,
+            flush_timeout_s=_BATCH_FLUSH_TIMEOUT_S
+        )
+
         # Stats
         self.total_translated = 0
         self.total_passthrough = 0
         self.total_errors = 0
+        self.total_batch_translated = 0
 
         logger.info(
             f"StreamingTranslator[{label}] ready | "
@@ -291,7 +374,7 @@ class StreamingTranslator:
     # Public API
     # ------------------------------------------------------------------
 
-    def feed(self, text: str) -> None:
+    def feed(self, text: str, is_partial: bool = False) -> None:
         """Translate a Whisper output chunk.
 
         The text is split on sentence boundaries. Each sentence is
@@ -338,6 +421,8 @@ class StreamingTranslator:
         with self._lock:
             self._context.clear()
         self._smoother.reset()
+        if self._batch_accumulator:
+            self._batch_accumulator.flush_immediate()
         logger.info(f"[StreamingTranslator:{self._label}] reset.")
 
     def flush(self) -> None:
@@ -348,7 +433,7 @@ class StreamingTranslator:
     # Internal — translation pipeline
     # ------------------------------------------------------------------
 
-    def _process_sentence(self, sentence: str, src_lang: str, tgt_lang: str) -> None:
+    def _process_sentence(self, sentence: str, src_lang: str, tgt_lang: str, is_partial: bool = False) -> None:
         """Translate one sentence and push result to the smoother."""
         t_start = time.perf_counter()
 
@@ -367,15 +452,22 @@ class StreamingTranslator:
                     self._context.append((sentence, output))
                 return
 
-            # ── 2. Build context hint from recent translated output ────────
-            context_hint = self._build_context_hint()
+            # ── 2. Check if batch translation is available ────────────────
+            batch = self._batch_accumulator.add_sentence(sentence)
+            if batch is not None:
+                # Translate batch
+                self._translate_batch(batch, src_lang, tgt_lang)
+                return
 
-            # ── 3. NLLB translation ───────────────────────────────────────
-            # Prepend context hint to give NLLB cross-chunk coherence
-            input_with_context = (
-                f"{context_hint} {sentence}".strip()
-                if context_hint else sentence
-            )
+            # Also check if timeout reached
+            if self._batch_accumulator.should_flush():
+                batch = self._batch_accumulator.flush_immediate()
+                if batch:
+                    self._translate_batch(batch, src_lang, tgt_lang)
+                    return
+
+            # ── 3. Single sentence translation (fallback) ─────────────────
+            context_hint = self._build_context_hint()
 
             logger.debug(
                 f"[StreamingTranslator:{self._label}] translating | "
@@ -384,12 +476,23 @@ class StreamingTranslator:
                 f"{sentence[:50]!r}"
             )
 
-            raw = self._translator.translate(
-                sentence,           # translate ONLY the new sentence
-                src_lang=src_lang,
-                tgt_lang=tgt_lang,
-            )
-            output = raw if isinstance(raw, str) else str(raw)
+            output = ""
+            if hasattr(self._translator, "translate_stream"):
+                for token in self._translator.translate_stream(
+                    sentence,
+                    src_lang=src_lang,
+                    tgt_lang=tgt_lang,
+                ):
+                    output += token
+                    if self._raw_callback:
+                        self._raw_callback(output.strip() + ("..." if is_partial else ""), True) # Emit partial
+            else:
+                raw = self._translator.translate(
+                    sentence,
+                    src_lang=src_lang,
+                    tgt_lang=tgt_lang,
+                )
+                output = raw if isinstance(raw, str) else str(raw)
 
             latency_ms = (time.perf_counter() - t_start) * 1000
             self.total_translated += 1
@@ -400,7 +503,15 @@ class StreamingTranslator:
                 f"{sentence[:40]!r} → {output[:40]!r}"
             )
 
-            # ── 4. Vietnamese post-correction ──────────────────────────────
+            # ── 4. Post-processing ──────────────────────────────────────────
+            # Apply translation post-processor first
+            try:
+                from core.translation_post_processor import TranslationPostProcessor
+                output = TranslationPostProcessor.fix_nllb_artifacts(output, tgt_lang)
+            except Exception as e:
+                logger.warning(f"Post-processor error: {e}")
+
+            # Vietnamese correction after post-processor
             if _is_vietnamese(tgt_lang) and output:
                 try:
                     from core.vietnamese_corrector import VietnameseCorrector
@@ -433,6 +544,54 @@ class StreamingTranslator:
                 self._smoother.push(sentence)
             except Exception:
                 pass
+
+    def _translate_batch(self, sentences: List[str], src_lang: str, tgt_lang: str) -> None:
+        """Translate multiple sentences in one NLLB call."""
+        t_start = time.perf_counter()
+
+        # Build context hint
+        context_hint = self._build_context_hint()
+
+        # Prepend context to first sentence
+        if context_hint and sentences:
+            sentences[0] = f"{context_hint} {sentences[0]}"
+
+        # Batch translate
+        raw_results = self._translator.translate(
+            sentences, src_lang=src_lang, tgt_lang=tgt_lang
+        )
+
+        # Normalize to list
+        results = raw_results if isinstance(raw_results, list) else [raw_results]
+
+        # Apply post-processor and Vietnamese correction to each result
+        processed_results = []
+        for result in results:
+            try:
+                from core.translation_post_processor import TranslationPostProcessor
+                result = TranslationPostProcessor.fix_nllb_artifacts(result, tgt_lang)
+            except Exception as e:
+                logger.warning(f"Post-processor error: {e}")
+
+            if _is_vietnamese(tgt_lang) and result:
+                try:
+                    from core.vietnamese_corrector import VietnameseCorrector
+                    result = VietnameseCorrector.apply_corrections(result)
+                except Exception as e:
+                    logger.warning(f"VietnameseCorrector error: {e}")
+
+            processed_results.append(result)
+
+        # Emit each result
+        for result in processed_results:
+            self._smoother.push(result)
+
+        latency_ms = (time.perf_counter() - t_start) * 1000
+        self.total_batch_translated += 1
+        logger.info(
+            f"[StreamingTranslator:{self._label}] BATCH ✓ "
+            f"{len(sentences)} sent | {latency_ms:.0f}ms"
+        )
 
     def _build_context_hint(self) -> str:
         """Build a truncated context string from recent translations.
@@ -467,7 +626,7 @@ class StreamingTranslator:
         """
         import re
         # Split after . ! ? ; : followed by whitespace and an uppercase/viet char
-        parts = re.split(r'(?<=[.!?;:])\s+', text)
+        parts = re.split(r'(?<=[.!?;:])\s+|(?<=[。！？；：])', text)
         result = []
         for part in parts:
             part = part.strip()

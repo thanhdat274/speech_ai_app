@@ -56,24 +56,23 @@ CHANNELS = 1
 
 # ── Chunk Duration Modes ─────────────────────────────────────────────────────
 #
-# v9 target:
+# Optimized for MAXIMUM ACCURACY on GTX 1650 Ti (4GB VRAM)
+# Longer chunks = more context per Whisper call = better accuracy
+#
 #   ULTRA_REALTIME: 2.4 s chunk size, 0.6 s stride
-#     - Larger window = more context per Whisper call
-#     - Stride overlap = smooth sentence continuity across chunks
-#     - Fewer total Whisper calls = less GPU contention
-#   BALANCED:       1.6 s chunk, 0.5 s stride
-#   ACCURACY:       2.4 s chunk, 0.8 s stride
+#   BALANCED:       2.0 s chunk, 0.6 s stride
+#   ACCURACY:       3.2 s chunk, 0.8 s stride — max accuracy mode
 ULTRA_CHUNK_DURATION_S    = 2.40   # v9: 2.4 s window
-BALANCED_CHUNK_DURATION_S = 1.60   # v9: 1.6 s
-ACCURACY_CHUNK_DURATION_S = 2.40   # v9: same window, longer stride
+BALANCED_CHUNK_DURATION_S = 2.00   # Increased from 1.60 for better accuracy
+ACCURACY_CHUNK_DURATION_S = 3.20   # Increased from 2.40 for max accuracy
 CHUNK_DURATION_S          = BALANCED_CHUNK_DURATION_S  # exported default
 
 # Capture frame: 200 ms — hardware callback writes this into RingBuffer
 CAPTURE_FRAME_S  = 0.20
 
-# v9: stride overlap = 0.6 s (was 0.2 s)
+# v9: stride overlap = 0.8 s (increased from 0.6s) for better sentence continuity
 # Overlap prevents clipping words at chunk boundaries
-OVERLAP_DURATION_S = 0.60
+OVERLAP_DURATION_S = 0.80
 
 RING_BUFFER_MAXFRAMES = 300
 
@@ -85,11 +84,9 @@ AI_QUEUE_MAXSIZE      = 50
 BACKPRESSURE_THRESHOLD = 0.80
 BACKPRESSURE_SLEEP_S   = 0.05
 
-# v9: dual workers for round-robin parallel window processing (req #4)
-# Two workers process 2.4s overlapping windows in parallel.
-# GTX 1650 Ti handles two float16 Whisper-large-v3 calls interleaved
-# at ~800ms each with sufficient VRAM headroom.
-AI_WORKER_COUNT = 2
+# Whisper inference is serialized inside AIEngine, so multiple dispatch
+# workers mainly add queue churn on 4 GB GPUs instead of real throughput.
+AI_WORKER_COUNT = 1
 
 MONITOR_IDLE_S     = 5.0
 MONITOR_WARN_S     = 1.0
@@ -496,9 +493,8 @@ class BaseCapture(ABC):
     def _ai_dispatch_worker(self, worker_id: int) -> None:
         """Pull audio chunks from the shared queue and invoke Whisper callback.
 
-        Two workers run in parallel (round-robin by queue consumption).
-        Each worker processes one 2.4s window at a time; while one waits
-        for GPU inference, the other can begin preprocessing the next window.
+        Keep a single dispatcher aligned with AIEngine's serialized inference
+        executor so queue depth reflects real model throughput more accurately.
         """
         import time as _t
         while self.is_running:

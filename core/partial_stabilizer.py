@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Tuning parameters
 # ─────────────────────────────────────────────────────────────────────────────
-MIN_PASSES   = 2    # A word must appear in this many consecutive passes to stabilize
-MAX_PENDING  = 12   # Force flush pending words after this many accumulate
+MIN_PASSES   = 3    # Increased from 2 — more consensus for stable output
+MAX_PENDING  = 20   # Increased from 12 — allow more pending words before flush
 WINDOW_S     = 4.0  # Rolling window of history to compare against (seconds)
 _MAX_HISTORY = 6    # Keep last N Whisper outputs for overlap detection
 

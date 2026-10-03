@@ -303,6 +303,82 @@ class LocalTranslator:
 #   - Language detection from Whisper result.language (passed by caller)
 #   - Supported: Vietnamese, English, Japanese, Korean, Chinese (+ more)
 # ─────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Streaming Translation
+    # ------------------------------------------------------------------
+    def translate_stream(
+        self,
+        text: str,
+        src_lang: str,
+        tgt_lang: str,
+    ):
+        """Translate a complete sentence and yield tokens as they are generated."""
+        if not text or not text.strip():
+            yield text
+            return
+
+        try:
+            # We copy logic from translate()
+            src_code = src_lang
+            tgt_code = tgt_lang
+            # Since translate_stream expects exactly the same _resolve_lang that we use
+            # Let's just trust they are valid language codes for tokenizer.
+            # LocalTranslator has it locally imported or in global scope in translation_engine.py.
+            # It's at the top of translation_engine.py.
+        except ValueError as e:
+            yield text
+            return
+
+        if src_code == tgt_code:
+            yield text
+            return
+
+        self._ensure_loaded()
+        if not self._model or not self._tokenizer:
+            yield text
+            return
+
+        import time
+        start = time.perf_counter()
+
+        try:
+            from transformers import TextIteratorStreamer
+            from threading import Thread
+
+            self._tokenizer.src_lang = src_code
+
+            inputs = self._tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(self._device)
+
+            tgt_lang_id = self._tokenizer.convert_tokens_to_ids(tgt_code)
+
+            streamer = TextIteratorStreamer(self._tokenizer, skip_special_tokens=True)
+
+            generation_kwargs = dict(
+                **inputs,
+                forced_bos_token_id=tgt_lang_id,
+                max_new_tokens=256,
+                num_beams=1,
+                do_sample=False,
+                streamer=streamer,
+            )
+
+            # Start generate in a background thread
+            thread = Thread(target=self._model.generate, kwargs=generation_kwargs)
+            thread.start()
+
+            for new_text in streamer:
+                if new_text:
+                    yield new_text
+
+        except Exception as e:
+            yield text
+
 class TranslationEngine:
     """Singleton wrapper providing async and sync translation.
 
@@ -543,3 +619,13 @@ class TranslationEngine:
             f"Stats: translated={self._total_translated}, "
             f"dropped={self._total_dropped}"
         )
+
+    def translate_stream(
+        self,
+        text: str,
+        src_lang: str = "vie_Latn",
+        tgt_lang: str = "eng_Latn",
+    ):
+        """Synchronous streaming translation."""
+        translator = self._get_translator()
+        yield from translator.translate_stream(text, src_lang, tgt_lang)

@@ -8,12 +8,14 @@ Integrates flawlessly with AppController for robust async AI processing.
 
 import sys
 import psutil
+from pathlib import Path
 from typing import Dict, Any
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QTextEdit, QComboBox,
-    QProgressBar, QFrame, QFileDialog, QSizePolicy, QSlider, QCheckBox
+    QProgressBar, QFrame, QFileDialog, QSizePolicy, QSlider, QCheckBox,
+    QMessageBox
 )
 from PySide6.QtCore import Qt, Slot, QTimer, QThread
 from PySide6.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QCloseEvent
@@ -439,20 +441,48 @@ class TranscriptPanel(QFrame):
         self.text_edit = QTextEdit()
         self.text_edit.setObjectName("TranscriptBox")
         self.text_edit.setReadOnly(True)
+        self._last_tr_pos = -1
         self._clear_transcript()
         layout.addWidget(self.text_edit, stretch=1)
         
+        # Export section
+        export_group = QFrame()
+        export_group.setStyleSheet("background-color: #111113; border-radius: 8px; border: 1px solid #1f1f22;")
+        export_layout = QHBoxLayout(export_group)
+        export_layout.setContentsMargins(15, 10, 15, 10)
+
+        self.export_formats = QComboBox()
+        self.export_formats.addItems([
+            "SRT (Subtitles)",
+            "VTT (Subtitles)",
+            "JSON",
+            "TXT (Plain Text)"
+        ])
+        self.export_formats.setFixedWidth(150)
+
+        self.export_button = QPushButton("Export...")
+        self.export_button.setProperty("class", "SecondaryAction")
+        self.export_button.clicked.connect(self._handle_export)
+        self.export_button.setFixedWidth(100)
+
+        export_layout.addWidget(QLabel("Export:"))
+        export_layout.addWidget(self.export_formats)
+        export_layout.addWidget(self.export_button)
+        export_layout.addStretch()
+
+        layout.addWidget(export_group)
+
         # Actions
         action_layout = QHBoxLayout()
         self.btn_action = QPushButton("Start Processing")
         self.btn_action.setProperty("class", "PrimaryAction")
         self.btn_action.setDisabled(True) # Disabled until file picked
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(False)
-        
+
         action_layout.addWidget(self.progress_bar)
         action_layout.addWidget(self.btn_action)
         layout.addLayout(action_layout)
@@ -484,18 +514,34 @@ class TranscriptPanel(QFrame):
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.End)
         
-        # Handle Speaker Tagging / Coloring seamlessly
-        colors = {"SYS": QColor("#10a37f"), "MIC": QColor("#5b8def"), "SPEAKER_01": QColor("#5b8def"), "SPEAKER_02": QColor("#10a37f")}
+        is_partial = result.get("is_partial", False)
         
+        # If we have an active TR partial, and STT wants to print partial, we ignore it to avoid UI mess
+        if is_partial and getattr(self, "_last_tr_pos", -1) != -1:
+            return
+            
+        if getattr(self, "_last_stt_pos", -1) != -1:
+            cursor.setPosition(self._last_stt_pos, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            self._last_stt_pos = -1
+
+        if is_partial:
+            self._last_stt_pos = cursor.position()
+            
+
+        colors = {"SYS": QColor("#10a37f"), "MIC": QColor("#5b8def"), "SPEAKER_01": QColor("#5b8def"), "SPEAKER_02": QColor("#10a37f")}
         for speaker, text in result.get("speakers", []):
             fmt = QTextCharFormat()
             fmt.setForeground(colors.get(speaker, QColor("#a0a0a0")))
             fmt.setFontWeight(QFont.Bold)
             cursor.insertText(f"[{speaker}] ", fmt)
             
-            fmt.setForeground(QColor("#ececec"))
+            fmt.setForeground(QColor("#88888e") if is_partial else QColor("#ececec"))
             fmt.setFontWeight(QFont.Normal)
-            cursor.insertText(f"{text}\n\n", fmt)
+            cursor.insertText(f"{text}{'...' if is_partial else ''}\n", fmt)
+            
+        if not is_partial:
+            self._last_stt_pos = -1
             
         self.text_edit.ensureCursorVisible()
 
@@ -503,7 +549,7 @@ class TranscriptPanel(QFrame):
         self.btn_action.setDisabled(state)
         self.btn_select_file.setDisabled(state)
         self.btn_clear.setDisabled(state)
-        
+
         if mode == "file":
             self.btn_action.setText("Processing Pipeline..." if state else "Start Processing")
             self.btn_live.setDisabled(state)
@@ -511,6 +557,60 @@ class TranscriptPanel(QFrame):
             self.btn_live.setText("⏹️ Stop Capture" if state else "🔊 Start System Audio")
             self.btn_live.setStyleSheet("color: #ef4444;" if state else "")
             self.btn_action.setDisabled(state)
+
+    def _handle_export(self):
+        """Handle export button click."""
+        from datetime import datetime
+
+        format_map = {
+            "SRT (Subtitles)": "srt",
+            "VTT (Subtitles)": "vtt",
+            "JSON": "json",
+            "TXT (Plain Text)": "txt"
+        }
+
+        selected = format_map[self.export_formats.currentText()]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"transcript_{timestamp}"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Transcript", default_name,
+            f"{selected.upper()} Files (*.{selected});;All Files (*)"
+        )
+
+        if file_path:
+            try:
+                # Get segments from the transcript buffer via the controller
+                segments = self.text_edit.toPlainText().strip()
+                if not segments:
+                    QMessageBox.warning(
+                        self, "Export Failed",
+                        "No transcript content to export."
+                    )
+                    return
+
+                # Export plain text for now (segments are displayed in text_edit)
+                if selected == "txt":
+                    Path(file_path).write_text(segments, encoding='utf-8')
+                else:
+                    # For SRT/VTT/JSON, we need the actual transcript buffer
+                    # This will be integrated with AppController's transcript_buffer
+                    QMessageBox.information(
+                        self, "Export Limitation",
+                        f"Export to {selected.upper()} requires integration with transcript buffer.\n\n"
+                        f"Current transcript saved as plain text."
+                    )
+                    Path(file_path.replace(f".{selected}", ".txt")).write_text(segments, encoding='utf-8')
+
+                QMessageBox.information(
+                    self, "Export Complete",
+                    f"Transcript exported to:\n{file_path}"
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Export Failed",
+                    f"Failed to export: {str(e)}"
+                )
 
 
 # =============================================================================
@@ -756,36 +856,45 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _handle_translation_ui(self, data: dict):
-        """Pipeline 2 output — display translated text in the transcript box.
-
-        Receives: {src, translated, text, clear?} from AppController.
-        Translated lines are shown in teal with a ↳ prefix so users can
-        visually distinguish them from the raw STT output (white/grey).
-        """
-        # Clear command from controller.clear_all()
+        """Pipeline 2 output — display translated text in the transcript box."""
         if data.get("clear"):
             self.page_transcript.text_edit.clear()
+            self.page_transcript._last_tr_pos = -1
             return
 
         translated = data.get("translated", "").strip()
-        src_text   = data.get("src", "").strip()
+        is_partial = data.get("is_partial", False)
+        
         if not translated:
             return
 
         cursor = self.page_transcript.text_edit.textCursor()
         cursor.movePosition(QTextCursor.End)
 
-        # Teal prefix label
+        # If we have an active partial, select and remove it
+        if getattr(self.page_transcript, "_last_tr_pos", -1) != -1:
+            cursor.setPosition(self.page_transcript._last_tr_pos, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            
+        # Optional: gray out partial text
+        color = "#88888e" if is_partial else "#a8d8c8"
+
+        # Record where this new block starts
+        self.page_transcript._last_tr_pos = cursor.position()
+        
         fmt_label = QTextCharFormat()
         fmt_label.setForeground(QColor("#10a37f"))
         fmt_label.setFontWeight(QFont.Bold)
         cursor.insertText("  ↳ [TR] ", fmt_label)
 
-        # Translated text in a lighter teal-ish white
         fmt_text = QTextCharFormat()
-        fmt_text.setForeground(QColor("#a8d8c8"))
+        fmt_text.setForeground(QColor(color))
         fmt_text.setFontWeight(QFont.Normal)
         cursor.insertText(f"{translated}\n", fmt_text)
+
+        if not is_partial:
+            # Commit the line permanently
+            self.page_transcript._last_tr_pos = -1
 
         self.page_transcript.text_edit.ensureCursorVisible()
 

@@ -32,6 +32,9 @@ class ConfigManager:
             # Ultra realtime mode: 0.3s chunks, aggressive VAD, no context memory.
             # Targets end-to-end latency < 1 second. Trade-off: slightly lower accuracy.
             "ultra_realtime_mode": False,
+            # Accuracy mode: larger chunks, more context, heavier Whisper decode.
+            # Accepts extra delay to maximize transcript quality.
+            "accuracy_mode": False,
             # Vietnamese-specific prompt injected automatically when language=="vi".
             # Add domain keywords (names, topics) here to boost recognition accuracy.
             "vi_base_prompt": (
